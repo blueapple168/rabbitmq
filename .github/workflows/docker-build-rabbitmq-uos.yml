@@ -47,7 +47,7 @@ permissions:
 
 jobs:
   ############################################
-  # 检测本次变更涉及的版本目录 (4.3 / 4.4 / ...)
+  # 检测本次变更涉及的版本目录 (4.3 / 4.4 / ...; 无 UOS 变更则跳过后续构建)
   ############################################
   detect:
     name: 检测待构建版本
@@ -85,9 +85,12 @@ jobs:
 
           # 取路径首段 (版本目录名)，过滤掉 .github 等非版本目录
           versions=$(printf '%s\n' "$files" | cut -d/ -f1 | grep -E '^[0-9]+(\.[0-9]+)*$' | sort -u || true)
+          # 仅保留实际存在 <版本>/UOS/Dockerfile 的目录 (防止 workflow_dispatch 手输错版本)
+          versions=$(printf '%s\n' "$versions" | while read -r v; do [ -f "$v/UOS/Dockerfile" ] && echo "$v"; done)
           if [ -z "$versions" ]; then
-            echo "::error::未找到任何 */UOS 变体目录"
-            exit 1
+            echo "::notice::本次变更未涉及任何 */UOS 目录，跳过构建"
+            echo "matrix=[]" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
           matrix=$(printf '%s\n' "$versions" | jq -Rsc 'split("\n") | map(select(length > 0)) | map({version: .})')
@@ -100,6 +103,7 @@ jobs:
   validate:
     name: "校验 Dockerfile (${{ matrix.version }}/UOS)"
     needs: detect
+    if: needs.detect.outputs.matrix != '[]'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     strategy:
@@ -144,7 +148,7 @@ jobs:
   build-push:
     name: "推送镜像 (${{ matrix.version }}/UOS)"
     needs: [detect, validate]
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.detect.outputs.matrix != '[]'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     strategy:
