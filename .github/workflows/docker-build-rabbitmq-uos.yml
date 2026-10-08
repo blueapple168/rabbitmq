@@ -104,7 +104,8 @@ jobs:
     timeout-minutes: 120
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.detect.outputs.matrix) }}
+      matrix:
+        include: ${{ fromJson(needs.detect.outputs.matrix) }}
     env:
       BUILD_DIR: ${{ matrix.version }}/UOS
     steps:
@@ -144,7 +145,8 @@ jobs:
     timeout-minutes: 120
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.detect.outputs.matrix) }}
+      matrix:
+        include: ${{ fromJson(needs.detect.outputs.matrix) }}
     permissions:
       contents: read
       packages: write
