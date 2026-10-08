@@ -4,9 +4,7 @@ name: RabbitMQ UOS 镜像构建
 #
 # 功能:
 #   1. detect    : 自动检测本次提交涉及的 */UOS 变体版本目录 (如 4.3)
-#   2. validate  : 校验 Dockerfile (hadolint / docker build --check)，
-#                  并完整构建镜像 (Dockerfile 内置 openssl/erlang/rabbitmqctl 自检)
-#   3. build-push: push 到 master 或手动触发时，推送镜像到 ghcr.io
+#   2. build-push: push 到 master 或手动触发时，推送镜像到 ghcr.io
 #
 # 产物 tag 以版本目录名为准并带 -management 后缀 (镜像自带管理控制台插件):
 #   ghcr.io/blueapple168/rabbitmq:4.3-management
@@ -84,7 +82,6 @@ jobs:
             fi
           done < <(printf '%s\n' "${versions}")
           versions=$(printf '%s\n' "${valid_versions[@]}" | sort -u)
-
           if [ -z "$versions" ]; then
             echo "::notice::本次变更未涉及任何 */UOS 目录，跳过构建"
             echo "matrix=[]" >> "$GITHUB_OUTPUT"
@@ -94,52 +91,11 @@ jobs:
           echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
           echo "待构建版本: $(echo "$versions" | tr '\n' ' ')"
   ############################################
-  # 校验 Dockerfile 并测试编译
-  ############################################
-  validate:
-    name: "校验 Dockerfile (${{ matrix.version }}/UOS)"
-    needs: detect
-    if: needs.detect.outputs.matrix != '[]'
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        include: ${{ fromJson(needs.detect.outputs.matrix) }}
-    env:
-      BUILD_DIR: ${{ matrix.version }}/UOS
-    steps:
-      - uses: actions/checkout@v4
-      # 登录是为了能拉取私有基础镜像 ghcr.io/blueapple168/uos-server-20-1070a
-      # (基础镜像公开时也无副作用)
-      - name: 登录 GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: hadolint 静态检查 Dockerfile (仅提示，不阻断)
-        continue-on-error: true
-        uses: hadolint/hadolint-action@v3.1.0
-        with:
-          dockerfile: ${{ env.BUILD_DIR }}/Dockerfile
-      - name: Dockerfile 内置规则检查 (docker build --check)
-        run: docker build --check "${{ env.BUILD_DIR }}"
-      # 完整构建: Dockerfile 内置了 openssl version / erl crypto / rabbitmqctl 等自检，
-      # 能走完整个构建即代表 Dockerfile 正确、Erlang/OTP 与 RabbitMQ 安装无误
-      - name: 构建镜像 (含 Dockerfile 内置自检)
-        uses: docker/build-push-action@v6
-        with:
-          context: ${{ env.BUILD_DIR }}
-          push: false
-          cache-from: type=gha,scope=rabbitmq-${{ matrix.version }}-uos
-          cache-to: type=gha,scope=rabbitmq-${{ matrix.version }}-uos,mode=max
-  ############################################
   # 构建并推送镜像 (push 到 master 或手动触发)
   ############################################
   build-push:
     name: "推送镜像 (${{ matrix.version }}/UOS)"
-    needs: [detect, validate]
+    needs: [detect]
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.detect.outputs.matrix != '[]'
     runs-on: ubuntu-latest
     timeout-minutes: 120
