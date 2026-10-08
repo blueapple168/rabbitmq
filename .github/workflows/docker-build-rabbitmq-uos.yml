@@ -1,0 +1,208 @@
+name: RabbitMQ UOS 镜像构建
+
+# 适用仓库结构: <版本>/UOS/{Dockerfile, docker-entrypoint.sh, conf.d/...}
+# 例如: https://github.com/blueapple168/rabbitmq/tree/master/4.3/UOS
+#
+# 功能:
+#   1. detect    : 自动检测本次提交涉及的 */UOS 变体版本目录 (如 4.3)
+#   2. validate  : 校验 Dockerfile (hadolint / docker build --check)，
+#                  并完整构建镜像 (Dockerfile 内置 openssl/erlang/rabbitmqctl 自检)
+#   3. build-push: push 到 master 或手动触发时，推送镜像到 ghcr.io
+#
+# 产物 tag 以版本目录名为准并带 -management 后缀 (镜像自带管理控制台插件):
+#   ghcr.io/blueapple168/rabbitmq:4.3-management
+# 并额外打上 Dockerfile 中 ARG RABBITMQ_VERSION 的完整版本号 tag (如 4.3.6-management)
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "**/UOS/**"
+      - ".github/workflows/docker-build-rabbitmq-uos.yml"
+  pull_request:
+    branches: [master]
+    paths:
+      - "**/UOS/**"
+      - ".github/workflows/docker-build-rabbitmq-uos.yml"
+  workflow_dispatch:
+    inputs:
+      version_dir:
+        description: "要构建的版本目录名 (如 4.3; 留空则构建仓库中所有 */UOS 变体)"
+        required: false
+        default: ""
+
+env:
+  REGISTRY: ghcr.io
+  # 构建平台; 如需 arm64 改为 "linux/amd64,linux/arm64"
+  # (前提: GHCR 上已推送对应架构的 UOS 基础镜像 uos-server-20-1070a)
+  PLATFORMS: linux/amd64
+
+concurrency:
+  group: rabbitmq-uos-${{ github.ref }}
+  cancel-in-progress: true
+
+# GITHUB_TOKEN 默认只读; 需要推送镜像的 job 单独提权 packages: write
+permissions:
+  contents: read
+
+jobs:
+  ############################################
+  # 检测本次变更涉及的版本目录 (4.3 / 4.4 / ...)
+  ############################################
+  detect:
+    name: 检测待构建版本
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 计算变更涉及的版本目录
+        id: set
+        run: |
+          set -eux
+          files=""
+          case "${{ github.event_name }}" in
+            pull_request)
+              git fetch origin "${{ github.base_ref }}"
+              files=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD" || true)
+              ;;
+            push)
+              files=$(git diff --name-only "${{ github.event.before }}" HEAD || true)
+              ;;
+          esac
+
+          # 取不到 diff (手动触发 / 新建分支首推 / 重跑) 时的兜底:
+          #   指定了 version_dir -> 只构建该版本; 否则构建仓库中全部 */UOS 变体
+          if [ -z "$files" ] && [ -n "${{ github.event.inputs.version_dir }}" ]; then
+            files="${{ github.event.inputs.version_dir }}/UOS/Dockerfile"
+          fi
+          if [ -z "$files" ]; then
+            files=$(find . -mindepth 3 -maxdepth 3 -path './*/UOS/Dockerfile' | sed 's|^\./||')
+          fi
+
+          # 取路径首段 (版本目录名)，过滤掉 .github 等非版本目录
+          versions=$(printf '%s\n' "$files" | cut -d/ -f1 | grep -E '^[0-9]+(\.[0-9]+)*$' | sort -u || true)
+          if [ -z "$versions" ]; then
+            echo "::error::未找到任何 */UOS 变体目录"
+            exit 1
+          fi
+
+          matrix=$(printf '%s\n' "$versions" | jq -Rsc 'split("\n") | map(select(length > 0)) | map({version: .})')
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          echo "待构建版本: $(echo "$versions" | tr '\n' ' ')"
+
+  ############################################
+  # 校验 Dockerfile 并测试编译
+  ############################################
+  validate:
+    name: "校验 Dockerfile (${{ matrix.version }}/UOS)"
+    needs: detect
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.matrix) }}
+    env:
+      BUILD_DIR: ${{ matrix.version }}/UOS
+    steps:
+      - uses: actions/checkout@v4
+
+      # 登录是为了能拉取私有基础镜像 ghcr.io/blueapple168/uos-server-20-1070a
+      # (基础镜像公开时也无副作用)
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: hadolint 静态检查 Dockerfile (仅提示，不阻断)
+        continue-on-error: true
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: ${{ env.BUILD_DIR }}/Dockerfile
+
+      - name: Dockerfile 内置规则检查 (docker build --check)
+        run: docker build --check "${{ env.BUILD_DIR }}"
+
+      # 完整构建: Dockerfile 内置了 openssl version / erl crypto / rabbitmqctl 等自检，
+      # 能走完整个构建即代表 Dockerfile 正确、Erlang/OTP 与 RabbitMQ 安装无误
+      - name: 构建镜像 (含 Dockerfile 内置自检)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.BUILD_DIR }}
+          push: false
+          cache-from: type=gha,scope=rabbitmq-${{ matrix.version }}-uos
+          cache-to: type=gha,scope=rabbitmq-${{ matrix.version }}-uos,mode=max
+
+  ############################################
+  # 构建并推送镜像 (push 到 master 或手动触发)
+  ############################################
+  build-push:
+    name: "推送镜像 (${{ matrix.version }}/UOS)"
+    needs: [detect, validate]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.matrix) }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      BUILD_DIR: ${{ matrix.version }}/UOS
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 设置 QEMU (仅多架构时需要)
+        if: contains(env.PLATFORMS, 'arm')
+        uses: docker/setup-qemu-action@v3
+
+      - name: 设置 Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 计算镜像名称与 tag
+        id: meta
+        run: |
+          set -eux
+          VERSION_DIR="${{ matrix.version }}"
+          # 完整版本号取自 Dockerfile 的 ARG RABBITMQ_VERSION (如 4.3.6)
+          FULL_VERSION="$(grep -m1 -E '^ARG RABBITMQ_VERSION=' "${{ env.BUILD_DIR }}/Dockerfile" | cut -d= -f2)"
+          test -n "$FULL_VERSION"
+          REPO="$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          IMAGE="${REGISTRY}/${REPO}"
+          # 镜像自带 rabbitmq_management 管理控制台插件，tag 统一带 -management 后缀
+          {
+            echo "image=${IMAGE}"
+            echo "tags=${IMAGE}:${VERSION_DIR}-management,${IMAGE}:${FULL_VERSION}-management"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 构建并推送
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.BUILD_DIR }}
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha,scope=rabbitmq-${{ matrix.version }}-uos
+          cache-to: type=gha,scope=rabbitmq-${{ matrix.version }}-uos,mode=max
+
+      - name: 汇总输出
+        run: |
+          {
+            echo "### 已推送镜像 (${{ matrix.version }}/UOS)"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}" | tr ',' '\n'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
