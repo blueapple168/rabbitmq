@@ -12,12 +12,12 @@
 #   5. apt-mark purge 清理编译工具 -> 多阶段构建天然隔离
 #   6. 官方 management 变体 (4.3/ubuntu/management) 的功能合并进来:
 #      启用 rabbitmq_management 插件、恢复 metrics collector、安装 rabbitmqadmin
+#
 # 构建流程 (与官方一致的多阶段源码编译):
 #   build-base       -> 编译工具链
 #   openssl-builder  -> /opt/openssl (自编 OpenSSL，避免与系统 libssl 冲突)
 #   erlang-builder   -> /opt/erlang  (自编 Erlang/OTP，链接自编 OpenSSL)
 #   runtime          -> 拷贝 /opt/erlang /opt/openssl，安装 RabbitMQ 通用二进制包
-
 ARG RABBITMQ_VERSION=4.3.6
 ARG OTP_VERSION=27.3.4.18
 ARG OPENSSL_VERSION=3.5.9
@@ -27,17 +27,12 @@ ARG BASE_IMAGE_TAG=uos-server-20-1070a:latest
 # ARG OPENSSL_SOURCE_SHA256=603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
 # ARG OTP_SOURCE_SHA256=920d00076d94f4850bd642d79da3229c8e5eea7ebc914996ee6dfd2154aeacf7
 # ARG RABBITMQ_SOURCE_SHA256=
-
 ############################################
 # build-base: 安装编译工具链
 ############################################
-
 FROM ghcr.io/blueapple168/${BASE_IMAGE_TAG} AS build-base
-
 ARG BUILDKIT_SBOM_SCAN_STAGE=true
-
 ENV TZ=Asia/Shanghai
-
 RUN set -eux; \
     echo "${TZ}" > /etc/timezone; \
     sed -i 's/\$StateMode/ufu/g' /etc/yum.repos.d/UnionTechOS.repo; \
@@ -58,23 +53,17 @@ RUN set -eux; \
         --setopt=timeout=300 --setopt=minrate=100 \
         tar gzip xz wget curl ca-certificates make gcc gcc-c++ glibc-devel \
         ncurses-devel perl perl-IPC-Cmd;
-
 ############################################
 # openssl-builder: 编译 OpenSSL 到 /opt/openssl
 ############################################
-
 FROM build-base AS openssl-builder
-
 ARG BUILDKIT_SBOM_SCAN_STAGE=true
-
 ARG OPENSSL_VERSION
 ENV OPENSSL_VERSION=${OPENSSL_VERSION}
 # 如需校验，取消下行注释并恢复 RUN 中对应检查
 # ENV OPENSSL_SOURCE_SHA256=603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
-
 # 安装到独立前缀，避免被系统软件误用 (与官方镜像一致)
 ENV OPENSSL_INSTALL_PATH_PREFIX=/opt/openssl
-
 RUN set -eux; \
     OPENSSL_SOURCE_URL="https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_VERSION/openssl-$OPENSSL_VERSION.tar.gz"; \
     OPENSSL_PATH="/usr/local/src/openssl-$OPENSSL_VERSION"; \
@@ -118,24 +107,17 @@ RUN set -eux; \
     : "=== 使用系统的 CA 证书 ===" ; \
     rmdir "$OPENSSL_CONFIG_DIR/certs" "$OPENSSL_CONFIG_DIR/private"; \
     ln -sf /etc/ssl/certs /etc/ssl/private "$OPENSSL_CONFIG_DIR";
-
 # 冒烟测试
 RUN $OPENSSL_INSTALL_PATH_PREFIX/bin/openssl version
-
 ############################################
 # erlang-builder: 编译 Erlang/OTP 到 /opt/erlang
 ############################################
-
 FROM openssl-builder AS erlang-builder
-
 ARG BUILDKIT_SBOM_SCAN_STAGE=true
-
 ARG OTP_VERSION
 ENV OTP_VERSION=${OTP_VERSION}
 # ENV OTP_SOURCE_SHA256=920d00076d94f4850bd642d79da3229c8e5eea7ebc914996ee6dfd2154aeacf7
-
 ENV ERLANG_INSTALL_PATH_PREFIX=/opt/erlang
-
 RUN set -eux; \
     OTP_SOURCE_URL="https://github.com/erlang/otp/releases/download/OTP-$OTP_VERSION/otp_src_$OTP_VERSION.tar.gz"; \
     OTP_PATH="/usr/local/src/otp-$OTP_VERSION"; \
@@ -200,32 +182,26 @@ RUN set -eux; \
     find "$ERLANG_INSTALL_PATH_PREFIX/lib/erlang" -type d -name examples -exec rm -rf '{}' +; \
     find "$ERLANG_INSTALL_PATH_PREFIX/lib/erlang" -type d -name src -exec rm -rf '{}' +; \
     find "$ERLANG_INSTALL_PATH_PREFIX/lib/erlang" -type d -name include -exec rm -rf '{}' +;
-
 # 校验 crypto/ssl 确实链接到 /opt/openssl 而非系统 libssl
 ENV PATH=$ERLANG_INSTALL_PATH_PREFIX/bin:$PATH
 RUN set -eux; \
     find $ERLANG_INSTALL_PATH_PREFIX -type f -name 'crypto.so' -exec ldd {} \; | grep -F "$OPENSSL_INSTALL_PATH_PREFIX/lib"; \
     erl -noshell -eval 'ok = crypto:start(), ok = io:format("~p~n~n~p~n~n", [crypto:supports(), ssl:versions()]), init:stop().'
-
 ############################################
 # runtime: 最终运行镜像
 ############################################
-
 FROM ghcr.io/blueapple168/${BASE_IMAGE_TAG}
-
 ARG RABBITMQ_VERSION
+ARG OTP_VERSION
 ARG GOSU_VERSION
 ARG RABBITMQADMIN_VERSION
-
 LABEL maintainer="blueapple" \
       version="1.0" \
       description="RabbitMQ ${RABBITMQ_VERSION} (management) with Erlang/OTP ${OTP_VERSION} on UOS 1070a" \
       org.opencontainers.image.base.name="registry.uniontech.com/uos-server-base/uos-server-20-1070a:latest" \
       org.opencontainers.image.title="RabbitMQ" \
       org.opencontainers.image.version="${RABBITMQ_VERSION}"
-
 ENV TZ=Asia/Shanghai
-
 RUN set -eux; \
     echo "${TZ}" > /etc/timezone; \
     sed -i 's/\$StateMode/ufu/g' /etc/yum.repos.d/UnionTechOS.repo; \
@@ -249,18 +225,13 @@ RUN set -eux; \
     \
     yum clean all; \
     rm -rf /var/cache/yum /var/cache/dnf
-
 # OPENSSL/ERLANG_INSTALL_PATH_PREFIX 定义在前面的阶段，此处重新定义
 ENV ERLANG_INSTALL_PATH_PREFIX=/opt/erlang
 ENV OPENSSL_INSTALL_PATH_PREFIX=/opt/openssl
-
 COPY --from=erlang-builder $ERLANG_INSTALL_PATH_PREFIX $ERLANG_INSTALL_PATH_PREFIX
 COPY --from=openssl-builder $OPENSSL_INSTALL_PATH_PREFIX $OPENSSL_INSTALL_PATH_PREFIX
-
 ENV PATH=$ERLANG_INSTALL_PATH_PREFIX/bin:$OPENSSL_INSTALL_PATH_PREFIX/bin:$PATH
-
 ENV RABBITMQ_DATA_DIR=/var/lib/rabbitmq
-
 RUN set -eux; \
     : "=== 配置 OpenSSL 使用系统 CA 证书 ===" ; \
     ln -vsf /etc/ssl/certs /etc/ssl/private "$OPENSSL_INSTALL_PATH_PREFIX/etc/ssl"; \
@@ -286,7 +257,6 @@ RUN set -eux; \
     \
     : "=== 允许 root 通过符号链接访问 erlang cookie ===" ; \
     ln -sf "$RABBITMQ_DATA_DIR/.erlang.cookie" /root/.erlang.cookie;
-
 # gosu: UOS 源中无此包，从 GitHub 下载静态二进制，用于从 root 降权执行
 RUN set -eux; \
     case "$(uname -m)" in \
@@ -299,11 +269,9 @@ RUN set -eux; \
     \
     : "=== 验证 gosu 可用 ===" ; \
     gosu nobody true;
-
 ENV RABBITMQ_VERSION=${RABBITMQ_VERSION}
 ENV RABBITMQ_HOME=/opt/rabbitmq
 ENV PATH=$RABBITMQ_HOME/sbin:$PATH
-
 RUN set -eux; \
     RABBITMQ_SOURCE_URL="https://github.com/rabbitmq/rabbitmq-server/releases/download/v$RABBITMQ_VERSION/rabbitmq-server-generic-unix-latest-toolchain-$RABBITMQ_VERSION.tar.xz"; \
     RABBITMQ_PATH="/usr/local/src/rabbitmq-$RABBITMQ_VERSION"; \
@@ -329,25 +297,19 @@ RUN set -eux; \
     gosu rabbitmq rabbitmq-plugins list; \
     : "=== 无残留 cookie ===" ; \
     rm "$RABBITMQ_DATA_DIR/.erlang.cookie";
-
 # 默认启用 Prometheus 风格指标 (https://github.com/docker-library/rabbitmq/issues/419)
 RUN gosu rabbitmq rabbitmq-plugins enable --offline rabbitmq_prometheus
-
 # 向后兼容：允许直接 COPY 自定义插件到 /plugins
 RUN ln -sf /opt/rabbitmq/plugins /plugins
-
 ############################################
 # management 插件 (参考官方 4.3/ubuntu/management/Dockerfile)
 ############################################
-
 # 启用 rabbitmq_management 插件 (管理 UI: 15672, TLS: 15671)
 RUN set -eux; \
     gosu rabbitmq rabbitmq-plugins enable --offline rabbitmq_management
-
 # 说明: 官方基础镜像默认通过 conf.d/20-management_agent.disable_metrics_collector.conf
 # 禁用 metrics collector 以启用 Prometheus 风格指标; 但管理 UI 依赖 metrics collector,
 # 因此本镜像不再放置该配置文件 (官方 management 变体是 build 后再 rm，单镜像直接省去)
-
 # rabbitmqadmin (rabbitmqadmin-ng): 官方 CLI 管理工具，按架构从 GitHub 下载静态二进制
 RUN set -eux; \
     case "$(uname -m)" in \
@@ -362,28 +324,20 @@ RUN set -eux; \
     \
     : "=== 验证 rabbitmqadmin 可用 ===" ; \
     rabbitmqadmin --help
-
 # 设置 HOME，使任意 --user 都知道 erlang cookie 放在哪里
 ENV HOME=$RABBITMQ_DATA_DIR
-
 # 数据目录建议挂载卷
 VOLUME $RABBITMQ_DATA_DIR
-
 # UTF-8 locale，避免 latin1 编码告警
 ENV LANG=C.UTF-8 LANGUAGE=C.UTF-8 LC_ALL=C.UTF-8
-
 # rabbitmq-server 启动脚本依据 RUNNING_UNDER_SYSTEMD 决定是否以 exec 启动 erl，
 # 设为 true 使 beam.smp 成为容器中的 PID 1（信号传递正确）
 ENV RUNNING_UNDER_SYSTEMD=true
-
 COPY --chown=rabbitmq:rabbitmq 10-defaults.conf 20-management_agent.disable_metrics_collector.conf /etc/rabbitmq/conf.d/
 COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/
 # RUN chmod +x /usr/local/bin/docker-entrypoint.sh
-
 ENTRYPOINT ["docker-entrypoint.sh"]
-
 # 4369/25672: epmd 与节点间通信; 5671/5672: AMQP(+TLS);
 # 15671/15672: 管理 UI(+TLS); 15691/15692: Prometheus 指标
 EXPOSE 4369 5671 5672 15671 15672 15691 15692 25672
-
 CMD ["rabbitmq-server"]
