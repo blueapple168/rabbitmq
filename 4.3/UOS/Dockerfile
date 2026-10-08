@@ -12,7 +12,6 @@
 #   5. apt-mark purge 清理编译工具 -> 多阶段构建天然隔离
 #   6. 官方 management 变体 (4.3/ubuntu/management) 的功能合并进来:
 #      启用 rabbitmq_management 插件、恢复 metrics collector、安装 rabbitmqadmin
-#
 # 构建流程 (与官方一致的多阶段源码编译):
 #   build-base       -> 编译工具链
 #   openssl-builder  -> /opt/openssl (自编 OpenSSL，避免与系统 libssl 冲突)
