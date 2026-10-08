@@ -377,7 +377,7 @@ ENV LANG=C.UTF-8 LANGUAGE=C.UTF-8 LC_ALL=C.UTF-8
 # 设为 true 使 beam.smp 成为容器中的 PID 1（信号传递正确）
 ENV RUNNING_UNDER_SYSTEMD=true
 
-COPY --chown=rabbitmq:rabbitmq conf.d/10-defaults.conf /etc/rabbitmq/conf.d/
+COPY --chown=rabbitmq:rabbitmq 10-defaults.conf 20-management_agent.disable_metrics_collector.conf /etc/rabbitmq/conf.d/
 COPY docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
