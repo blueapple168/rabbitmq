@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
+# SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 # check=skip=SecretsUsedInArgOrEnv
 #
 # 参考官方镜像: https://github.com/docker-library/rabbitmq (4.3/ubuntu/Dockerfile)
