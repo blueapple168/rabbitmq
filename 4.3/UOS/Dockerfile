@@ -90,10 +90,10 @@ RUN set -eux; \
     fi; \
     yum makecache; \
     \
-    : "=== 运行时依赖：ca-certificates (TLS)、tzdata (时区)、xz (解压 RabbitMQ 发行包)、wget/curl (下载)、procps (rabbitmqctl wait 需要 ps) ===" ; \
+    : "=== 运行时依赖：ca-certificates (TLS)、tzdata (时区)、xz (解压 RabbitMQ 发行包)、wget/curl (下载)、procps (rabbitmqctl wait 需要 ps)、findutils+hostname (docker-entrypoint.sh 依赖) ===" ; \
     yum install -y --setopt=install_weak_deps=false --nogpgcheck --nodocs \
         --setopt=timeout=300 --setopt=minrate=100 \
-        ca-certificates tar tzdata xz wget curl procps gnupg2; \
+        ca-certificates tar tzdata xz wget curl procps gnupg2 findutils hostname; \
     \
     : "=== 下载 erlang-rpm 并按架构映射官方 SHA256 (x86_64/aarch64 对应 el8 资产) ===" ; \
     case "$(uname -m)" in \
