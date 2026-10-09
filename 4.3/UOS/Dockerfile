@@ -62,6 +62,10 @@ LABEL maintainer="blueapple" \
 
 ENV TZ=Asia/Shanghai
 
+# UTF-8 locale，避免 latin1 编码告警
+# (必须放在执行 erlang/rabbitmqctl 的 RUN 之前，否则冒烟测试阶段 VM 以 latin1 编码启动并告警)
+ENV LANG=C.UTF-8 LANGUAGE=C.UTF-8 LC_ALL=C.UTF-8
+
 # Erlang RPM 来源: RabbitMQ 官方团队维护的零依赖包 (自带 OpenSSL 运行时)
 # el8 对应 UOS Server 20 (RHEL 8 兼容, glibc 2.28)，无需源码编译 OpenSSL/Erlang
 ENV ERLANG_RPM_BASE_URL=https://github.com/rabbitmq/erlang-rpm/releases/download/v${OTP_VERSION}
@@ -250,9 +254,6 @@ ENV HOME=$RABBITMQ_DATA_DIR
 
 # 数据目录建议挂载卷
 VOLUME $RABBITMQ_DATA_DIR
-
-# UTF-8 locale，避免 latin1 编码告警
-ENV LANG=C.UTF-8 LANGUAGE=C.UTF-8 LC_ALL=C.UTF-8
 
 # rabbitmq-server 启动脚本依据 RUNNING_UNDER_SYSTEMD 决定是否以 exec 启动 erl，
 # 设为 true 使 beam.smp 成为容器中的 PID 1（信号传递正确）
