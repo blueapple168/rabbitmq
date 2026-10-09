@@ -5,10 +5,16 @@ name: RabbitMQ UOS 镜像构建
 # 功能:
 #   1. detect    : 自动检测本次提交涉及的 */UOS 变体版本目录 (如 4.3)
 #   2. build-push: push 到 master 或手动触发时，推送镜像到 ghcr.io
+#   3. 上游监听  : 定时 (schedule) 或手动 (check_upstream=true) 检查
+#      https://github.com/rabbitmq/rabbitmq-server/releases 官方发布的最新
+#      <版本目录>.x 正式版本 (排除 draft/prerelease/rc)，发现新版本时:
+#        a) 自动更新 <版本>/UOS/Dockerfile 中的 ARG RABBITMQ_VERSION 并提交回 master
+#        b) 同一次 run 内立即用新版本号构建镜像 (tar.xz 的 .asc PGP 签名校验
+#           随版本号自动适配，无需人工介入)
 #
 # 产物 tag 以版本目录名为准并带 -management 后缀 (镜像自带管理控制台插件):
 #   ghcr.io/blueapple168/rabbitmq:4.3-management
-# 并额外打上 Dockerfile 中 ARG RABBITMQ_VERSION 的完整版本号 tag (如 4.3.6-management)
+#   ghcr.io/blueapple168/rabbitmq:4.3.6-management (完整版本号，随上游自动更新)
 on:
   push:
     branches: [master]
@@ -20,12 +26,20 @@ on:
     paths:
       - "**/UOS/**"
       - ".github/workflows/docker-build-rabbitmq-uos.yml"
+  schedule:
+    # 每日 UTC 02:00 (北京时间 10:00) 检查上游 rabbitmq-server 最新正式版
+    - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
       version_dir:
         description: "要构建的版本目录名 (如 4.3; 留空则构建仓库中所有 */UOS 变体)"
         required: false
         default: ""
+      check_upstream:
+        description: "检查上游 rabbitmq-server 最新正式版 (有新版则自动升级构建)"
+        required: false
+        default: false
+        type: boolean
 env:
   REGISTRY: ghcr.io
   # 构建平台; 如需 arm64 改为 "linux/amd64,linux/arm64"
@@ -34,69 +48,157 @@ env:
 concurrency:
   group: rabbitmq-uos-${{ github.ref }}
   cancel-in-progress: true
-# GITHUB_TOKEN 默认只读; 需要推送镜像的 job 单独提权 packages: write
+# GITHUB_TOKEN 默认只读; detect 需写权限提交版本升级 commit，
+# build-push 需 packages:write 推送镜像
 permissions:
   contents: read
 jobs:
   ############################################
-  # 检测本次变更涉及的版本目录 (4.3 / 4.4 / ...; 无 UOS 变更则跳过后续构建)
+  # 检测待构建版本 (两种模式):
+  #   diff     : push/pull_request/手动 - 由本次提交涉及的文件变更决定 (原有逻辑)
+  #   upstream : schedule/手动(check_upstream) - 由上游官方最新正式版决定，
+  #              有新版本时同步更新 Dockerfile 并提交回 master
+  # 输出 matrix: [{version: "4.3", rabbitmq_version: "4.3.6"}]
+  # 无待构建项时输出 []
   ############################################
   detect:
     name: 检测待构建版本
     runs-on: ubuntu-latest
+    permissions:
+      # 上游模式需要提交 ARG RABBITMQ_VERSION 升级 commit 到 master
+      # (GITHUB_TOKEN 的 push 不会触发新的 workflow run，不会造成重复构建)
+      contents: write
     outputs:
       matrix: ${{ steps.set.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: 计算变更涉及的版本目录
+      - name: 计算待构建版本矩阵
         id: set
         run: |
           set -eux
-          files=""
+
+          mode="diff"
           case "${{ github.event_name }}" in
-            pull_request)
-              git fetch origin "${{ github.base_ref }}"
-              files=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD" || true)
-              ;;
-            push)
-              files=$(git diff --name-only "${{ github.event.before }}" HEAD || true)
+            schedule) mode="upstream" ;;
+            workflow_dispatch)
+              if [ "${{ inputs.check_upstream }}" = "true" ]; then
+                mode="upstream"
+              fi
               ;;
           esac
-          # 取不到 diff (手动触发 / 新建分支首推 / 重跑) 时的兜底:
-          #   指定了 version_dir -> 只构建该版本; 否则构建仓库中全部 */UOS 变体
-          if [ -z "$files" ] && [ -n "${{ github.event.inputs.version_dir }}" ]; then
-            files="${{ github.event.inputs.version_dir }}/UOS/Dockerfile"
-          fi
-          if [ -z "$files" ]; then
-            files=$(find . -mindepth 3 -maxdepth 3 -path './*/UOS/Dockerfile' | sed 's|^\./||')
-          fi
-          # 取路径首段 (版本目录名)，过滤掉 .github 等非版本目录
-          versions=$(printf '%s\n' "$files" | cut -d/ -f1 | grep -E '^[0-9]+(\.[0-9]+)*$' | sort -u || true)
-          # 仅保留实际存在 <版本>/UOS/Dockerfile 的目录 (防止 workflow_dispatch 手输错版本)
-          declare -a valid_versions=()
-          while IFS= read -r v; do
-            if [[ -n "${v}" && -f "${v}/UOS/Dockerfile" ]]; then
-              valid_versions+=("${v}")
+          echo "mode=${mode}" >> "$GITHUB_STEP_SUMMARY" || true
+
+          matrix_entries=""
+          should_commit="no"
+
+          if [ "$mode" = "upstream" ]; then
+            ########################################
+            # 上游监听模式: 检查 rabbitmq-server 官方 releases
+            # 仅取与版本目录 (如 4.3) 匹配的正式版 tag: ^v4.3.[0-9]+$
+            # 排除 draft / prerelease (rc/alpha/beta 均为 prerelease)
+            ########################################
+            while IFS= read -r dockerfile; do
+              vdir="$(dirname "$(dirname "$dockerfile")")"   # 4.3/UOS -> 4.3
+              current="$(grep -m1 -E '^ARG RABBITMQ_VERSION=' "$dockerfile" | cut -d= -f2)"
+              test -n "$current"
+              latest="$(
+                curl -fsSL -H 'Accept: application/vnd.github+json' \
+                  'https://api.github.com/repos/rabbitmq/rabbitmq-server/releases?per_page=100' \
+                | jq -r --arg v "$vdir" '
+                    [ .[]
+                      | select(.draft == false and .prerelease == false)
+                      | select(.tag_name | test("^v" + $vdir + "\\.[0-9]+$"))
+                      | .tag_name | ltrimstr("v")
+                    ]
+                    | sort_by(split(".") | map(tonumber))
+                    | last // empty
+                  '
+              )"
+              if [ -z "$latest" ]; then
+                echo "::notice::${vdir}: 上游未发现匹配 v${vdir}.x 的正式版，跳过"
+                continue
+              fi
+              if [ "$latest" != "$current" ]; then
+                echo "::notice::${vdir}: 上游有新版本 ${current} -> ${latest}"
+                sed -i "s/^ARG RABBITMQ_VERSION=.*/ARG RABBITMQ_VERSION=${latest}/" "$dockerfile"
+                matrix_entries="${matrix_entries}{\"version\":\"${vdir}\",\"rabbitmq_version\":\"${latest}\"},"
+                should_commit="yes"
+              else
+                echo "::notice::${vdir}: 已是上游最新正式版 ${current}，无需构建"
+              fi
+            done < <(find . -mindepth 3 -maxdepth 3 -path './*/UOS/Dockerfile' | sed 's|^\./||' | sort)
+
+            # 提交 Dockerfile 版本升级，保持仓库与上游同步 (仅上游模式)
+            if [ "$should_commit" = "yes" ]; then
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git add -u
+              if git diff --cached --quiet; then
+                echo "::warning::版本号已更新但没有可提交的变更"
+              else
+                git commit -m "chore(bump): RABBITMQ_VERSION 升级为上游最新正式版 (由定时任务自动检测)"
+                if git push; then
+                  echo "已提交版本升级 commit 到 master"
+                else
+                  # 推送失败不阻断构建: 本次 run 仍会用新版本号构建镜像
+                  echo "::warning::版本升级 commit 推送失败 (可能因分支保护)，本次构建继续使用检测到的新版本号"
+                fi
+              fi
             fi
-          done < <(printf '%s\n' "${versions}")
-          versions=$(printf '%s\n' "${valid_versions[@]}" | sort -u)
-          if [ -z "$versions" ]; then
-            echo "::notice::本次变更未涉及任何 */UOS 目录，跳过构建"
+          else
+            ########################################
+            # 变更检测模式 (原有逻辑): 由本次提交涉及的文件决定
+            ########################################
+            files=""
+            case "${{ github.event_name }}" in
+              pull_request)
+                git fetch origin "${{ github.base_ref }}"
+                files=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD" || true)
+                ;;
+              push)
+                files=$(git diff --name-only "${{ github.event.before }}" HEAD || true)
+                ;;
+            esac
+            # 取不到 diff (手动触发 / 新建分支首推 / 重跑) 时的兜底:
+            #   指定了 version_dir -> 只构建该版本; 否则构建仓库中全部 */UOS 变体
+            if [ -z "$files" ] && [ -n "${{ github.event.inputs.version_dir }}" ]; then
+              files="${{ github.event.inputs.version_dir }}/UOS/Dockerfile"
+            fi
+            if [ -z "$files" ]; then
+              files=$(find . -mindepth 3 -maxdepth 3 -path './*/UOS/Dockerfile' | sed 's|^\./||')
+            fi
+            # 取路径首段 (版本目录名)，过滤掉 .github 等非版本目录
+            versions=$(printf '%s\n' "$files" | cut -d/ -f1 | grep -E '^[0-9]+(\.[0-9]+)*$' | sort -u || true)
+            # 仅保留实际存在 <版本>/UOS/Dockerfile 的目录 (防止 workflow_dispatch 手输错版本)
+            while IFS= read -r v; do
+              if [[ -n "${v}" && -f "${v}/UOS/Dockerfile" ]]; then
+                cur="$(grep -m1 -E '^ARG RABBITMQ_VERSION=' "${v}/UOS/Dockerfile" | cut -d= -f2)"
+                test -n "$cur"
+                matrix_entries="${matrix_entries}{\"version\":\"${v}\",\"rabbitmq_version\":\"${cur}\"},"
+              fi
+            done < <(printf '%s\n' "${versions}")
+          fi
+
+          matrix="[$(printf '%s' "$matrix_entries" | sed 's/,$//')]"
+          if [ "$matrix" = "[]" ]; then
+            echo "::notice::没有需要构建的版本，跳过"
             echo "matrix=[]" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          matrix=$(printf '%s\n' "$versions" | jq -Rsc 'split("\n") | map(select(length > 0)) | map({version: .})')
           echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
-          echo "待构建版本: $(echo "$versions" | tr '\n' ' ')"
+          echo "待构建矩阵: ${matrix}" >> "$GITHUB_STEP_SUMMARY"
   ############################################
-  # 构建并推送镜像 (push 到 master 或手动触发)
+  # 构建并推送镜像 (push 到 master / 手动触发 / 定时检测到上游新版本)
   ############################################
   build-push:
     name: "推送镜像 (${{ matrix.version }}/UOS)"
     needs: [detect]
-    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.detect.outputs.matrix != '[]'
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch' ||
+       github.event_name == 'schedule') &&
+      needs.detect.outputs.matrix != '[]'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     strategy:
@@ -126,8 +228,10 @@ jobs:
         run: |
           set -eux
           VERSION_DIR="${{ matrix.version }}"
-          # 完整版本号取自 Dockerfile 的 ARG RABBITMQ_VERSION (如 4.3.6)
-          FULL_VERSION="$(grep -m1 -E '^ARG RABBITMQ_VERSION=' "${{ env.BUILD_DIR }}/Dockerfile" | cut -d= -f2)"
+          # 完整版本号来自 detect 矩阵:
+          #   - 变更模式  = Dockerfile 中的 ARG RABBITMQ_VERSION
+          #   - 上游模式  = 官方 releases 检测到的最新正式版
+          FULL_VERSION="${{ matrix.rabbitmq_version }}"
           test -n "$FULL_VERSION"
           REPO="$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
           IMAGE="${REGISTRY}/${REPO}"
@@ -142,6 +246,11 @@ jobs:
           context: ${{ env.BUILD_DIR }}
           platforms: ${{ env.PLATFORMS }}
           push: true
+          # RABBITMQ_VERSION 通过 build-arg 传入:
+          #   - 上游模式下与已提交的 Dockerfile 值一致 (双保险)
+          #   - erlang RPM 版本/SHA256/OTP 不随 RabbitMQ 补丁版本变化，无需更新
+          build-args: |
+            RABBITMQ_VERSION=${{ matrix.rabbitmq_version }}
           tags: ${{ steps.meta.outputs.tags }}
           cache-from: type=gha,scope=rabbitmq-${{ matrix.version }}-uos
           cache-to: type=gha,scope=rabbitmq-${{ matrix.version }}-uos,mode=max

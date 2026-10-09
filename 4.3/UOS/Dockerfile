@@ -2,41 +2,60 @@
 # check=skip=SecretsUsedInArgOrEnv
 #
 # 参考官方镜像: https://github.com/docker-library/rabbitmq (4.3/ubuntu/Dockerfile)
-# 官方基于 ubuntu:24.04 + apt，本文件适配 UOS Server 20 1070a (yum/dnf)
+# 官方基于 ubuntu:24.04 源码编译 OpenSSL + Erlang/OTP，本文件适配 UOS Server 20 1070a (yum/dnf)
 #
 # 与官方的主要差异:
-#   1. apt-get -> yum/dnf，包名按 RHEL 系调整 (perl-IPC-Cmd / ncurses-devel 等)
-#   2. dpkg 架构探测 (dpkg --print-architecture / dpkg-architecture) -> uname -m
+#   1. 放弃源码编译 OpenSSL + Erlang/OTP（UOS 20 gcc/perl/autotools 较老，编译阶段报错多）
+#      改用 RabbitMQ 官方团队维护的零依赖 Erlang RPM 仓库:
+#      https://github.com/rabbitmq/erlang-rpm  (https://www.rabbitmq.com/docs/install-rpm#downloads)
+#      erlang-27.3.4.18-1.el8.<arch>.rpm 自带 OpenSSL 运行时，RHEL8/UOS Server 20 (glibc 2.28) 兼容
+#   2. RabbitMQ 本体使用官方通用二进制包 (标准工具链版，非 latest-toolchain):
+#      https://github.com/rabbitmq/rabbitmq-server/releases/download/v4.3.6/rabbitmq-server-generic-unix-4.3.6.tar.xz
+#      解压到 /opt/rabbitmq，布局与官方 Docker 镜像一致，entrypoint/conf.d 零改动
 #   3. gosu 不在 UOS 源中，改为从 GitHub releases 下载静态二进制
-#   4. PGP 签名校验与 sha256 校验默认关闭 (内网环境 keyserver 访问不便)
-#   5. apt-mark purge 清理编译工具 -> 多阶段构建天然隔离
-#   6. 官方 management 变体 (4.3/ubuntu/management) 的功能合并进来:
+#   4. 下载产物完整性校验 (双重)：
+#      a) RabbitMQ tar.xz 通过官方 .asc PGP 签名校验 (gpg keyserver: hkps://keys.openpgp.org，
+#         与官方 alpine/ubuntu Dockerfile 一致)
+#      b) Erlang RPM 通过官方 SHA256 摘要校验 —— rabbitmq/erlang-rpm release 不提供 .asc
+#         签名文件 (34 个资产均为 .rpm)，官方校验手段是 release 元数据中的 digest，
+#         摘要取自 https://api.github.com/repos/rabbitmq/erlang-rpm/releases/tags/v27.3.4.18
+#   5. 官方 management 变体 (4.3/ubuntu/management) 的功能合并进来:
 #      启用 rabbitmq_management 插件、恢复 metrics collector、安装 rabbitmqadmin
 #
-# 构建流程 (与官方一致的多阶段源码编译):
-#   build-base       -> 编译工具链
-#   openssl-builder  -> /opt/openssl (自编 OpenSSL，避免与系统 libssl 冲突)
-#   erlang-builder   -> /opt/erlang  (自编 Erlang/OTP，链接自编 OpenSSL)
-#   runtime          -> 拷贝 /opt/erlang /opt/openssl，安装 RabbitMQ 通用二进制包
+# 构建流程 (单阶段):
+#   yum 调优 -> 安装 erlang RPM (零依赖) -> 创建 rabbitmq 用户/目录 -> gosu
+#   -> 解压 rabbitmq-server-generic-unix tar.xz -> 冒烟测试 -> 启用插件 -> rabbitmqadmin
 
 ARG RABBITMQ_VERSION=4.3.6
 ARG OTP_VERSION=27.3.4.18
-ARG OPENSSL_VERSION=3.5.9
 ARG GOSU_VERSION=1.17
 ARG RABBITMQADMIN_VERSION=2.35.0
 ARG BASE_IMAGE_TAG=uos-server-20-1070a:latest
 
-# ARG OPENSSL_SOURCE_SHA256=603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
-# ARG OTP_SOURCE_SHA256=920d00076d94f4850bd642d79da3229c8e5eea7ebc914996ee6dfd2154aeacf7
-# ARG RABBITMQ_SOURCE_SHA256=
+# erlang-rpm release 无 .asc 签名文件，使用官方 digest (GitHub API) 做 SHA256 校验
+# 升级 OTP_VERSION 时需同步更新以下两个摘要
+ARG ERLANG_RPM_SHA256_X86_64=54241d7f5402bb51d0b6a1cb04d1de3b3bfa1b7d80fe26eafcdbb479716384b2
+ARG ERLANG_RPM_SHA256_AARCH64=0fa47849155d6ea8697013ea787b24a488c3748a53d4645b769dfc51916a1ea9
 
 ############################################
-# build-base: 安装编译工具链
+# runtime: 最终运行镜像（单阶段）
 ############################################
 
-FROM ghcr.io/blueapple168/${BASE_IMAGE_TAG} AS build-base
+FROM ghcr.io/blueapple168/${BASE_IMAGE_TAG}
 
-ARG BUILDKIT_SBOM_SCAN_STAGE=true
+ARG RABBITMQ_VERSION
+ARG OTP_VERSION
+ARG GOSU_VERSION
+ARG RABBITMQADMIN_VERSION
+ARG ERLANG_RPM_SHA256_X86_64
+ARG ERLANG_RPM_SHA256_AARCH64
+
+LABEL maintainer="blueapple" \
+        version="1.0" \
+        description="RabbitMQ ${RABBITMQ_VERSION} (management) with Erlang/OTP ${OTP_VERSION} on UOS 1070a" \
+        org.opencontainers.image.base.name="registry.uniontech.com/uos-server-base/uos-server-20-1070a:latest" \
+        org.opencontainers.image.title="RabbitMQ" \
+        org.opencontainers.image.version="${RABBITMQ_VERSION}"
 
 ENV TZ=Asia/Shanghai
 
@@ -55,234 +74,54 @@ RUN set -eux; \
     fi; \
     yum makecache; \
     \
-    : "=== 编译依赖：gcc/perl/make 编 OpenSSL + Erlang/OTP；perl-IPC-Cmd 是 OpenSSL Configure 必需 ===" ; \
+    : "=== 运行时依赖：ca-certificates (TLS)、tzdata (时区)、xz (解压 RabbitMQ 发行包)、wget/curl (下载)、procps (rabbitmqctl wait 需要 ps) ===" ; \
     yum install -y --setopt=install_weak_deps=false --nogpgcheck --nodocs \
         --setopt=timeout=300 --setopt=minrate=100 \
-        tar gzip xz wget curl ca-certificates make gcc gcc-c++ glibc-devel \
-        ncurses-devel perl perl-IPC-Cmd;
-
-############################################
-# openssl-builder: 编译 OpenSSL 到 /opt/openssl
-############################################
-
-FROM build-base AS openssl-builder
-
-ARG BUILDKIT_SBOM_SCAN_STAGE=true
-
-ARG OPENSSL_VERSION
-ENV OPENSSL_VERSION=${OPENSSL_VERSION}
-# 如需校验，取消下行注释并恢复 RUN 中对应检查
-# ENV OPENSSL_SOURCE_SHA256=603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
-
-# 安装到独立前缀，避免被系统软件误用 (与官方镜像一致)
-ENV OPENSSL_INSTALL_PATH_PREFIX=/opt/openssl
-
-RUN set -eux; \
-    OPENSSL_SOURCE_URL="https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_VERSION/openssl-$OPENSSL_VERSION.tar.gz"; \
-    OPENSSL_PATH="/usr/local/src/openssl-$OPENSSL_VERSION"; \
-    OPENSSL_CONFIG_DIR="$OPENSSL_INSTALL_PATH_PREFIX/etc/ssl"; \
-    \
-    wget --progress dot:giga --output-document "$OPENSSL_PATH.tar.gz" "$OPENSSL_SOURCE_URL"; \
-    \
-    : "=== sha256 校验（内网/无校验需求时跳过；启用时取消注释并在顶部恢复 SHA ARG/ENV） ===" ; \
-    echo "$OPENSSL_SOURCE_SHA256 *$OPENSSL_PATH.tar.gz" | sha256sum --check --strict - || echo "skip sha256 check"; \
-    \
-    mkdir -p "$OPENSSL_PATH"; \
-    tar --extract --file "$OPENSSL_PATH.tar.gz" --directory "$OPENSSL_PATH" --strip-components 1; \
-    \
-    : "=== 架构映射: dpkg -> uname -m ===" ; \
-    case "$(uname -m)" in \
-        x86_64)  opensslMachine='linux-x86_64' ;; \
-        aarch64) opensslMachine='linux-aarch64' ;; \
-        *) echo >&2 "error: unsupported arch: '$(uname -m)'"; exit 1 ;; \
-    esac; \
-    \
-    cd "$OPENSSL_PATH"; \
-    MACHINE="$opensslMachine" \
-    RELEASE="4.x.y-z" \
-    SYSTEM='Linux' \
-    BUILD='???' \
-    ./Configure \
-        "$opensslMachine" \
-        shared \
-        enable-fips \
-        --prefix="$OPENSSL_INSTALL_PATH_PREFIX" \
-        --openssldir="$OPENSSL_CONFIG_DIR" \
-        --libdir="$OPENSSL_INSTALL_PATH_PREFIX/lib" \
-        -Wl,-rpath="$OPENSSL_INSTALL_PATH_PREFIX/lib" \
-    ; \
-    \
-    : "=== 编译并安装 OpenSSL ===" ; \
-    make -j "$(getconf _NPROCESSORS_ONLN)"; \
-    make install_sw install_ssldirs install_fips; \
-    ldconfig; \
-    \
-    : "=== 使用系统的 CA 证书（修复原ln多源参数错误） ===" ; \
-    rmdir "$OPENSSL_CONFIG_DIR/certs" "$OPENSSL_CONFIG_DIR/private"; \
-    ln -sf /etc/ssl/certs      "$OPENSSL_CONFIG_DIR/certs"; \
-    ln -sf /etc/ssl/private    "$OPENSSL_CONFIG_DIR/private";
-
-# 冒烟测试
-RUN $OPENSSL_INSTALL_PATH_PREFIX/bin/openssl version
-
-############################################
-# erlang-builder: 编译 Erlang/OTP 到 /opt/erlang
-############################################
-
-FROM openssl-builder AS erlang-builder
-
-ARG BUILDKIT_SBOM_SCAN_STAGE=true
-
-ARG OTP_VERSION
-ENV OTP_VERSION=${OTP_VERSION}
-# ENV OTP_SOURCE_SHA256=920d00076d94f4850bd642d79da3229c8e5eea7ebc914996ee6dfd2154aeacf7
-
-ENV ERLANG_INSTALL_PATH_PREFIX=/opt/erlang
-
-RUN set -eux; \
-    OTP_SOURCE_URL="https://github.com/erlang/otp/releases/download/OTP-$OTP_VERSION/otp_src_$OTP_VERSION.tar.gz"; \
-    OTP_PATH="/usr/local/src/otp-$OTP_VERSION"; \
-    \
-    mkdir -p "$OTP_PATH"; \
-    wget --progress dot:giga --output-document "$OTP_PATH.tar.gz" "$OTP_SOURCE_URL"; \
-    echo "$OTP_SOURCE_SHA256 *$OTP_PATH.tar.gz" | sha256sum --check --strict - || echo "skip sha256 check"; \
-    tar --extract --file "$OTP_PATH.tar.gz" --directory "$OTP_PATH" --strip-components 1; \
-    \
-    : "=== 配置 Erlang/OTP：裁剪不需要的应用，链接自编 OpenSSL ===" ; \
-    cd "$OTP_PATH"; \
-    export ERL_TOP="$OTP_PATH"; \
-    : "-rpath 保证 crypto/ssl 优先加载 /opt/openssl/lib 下的 libssl，避免与系统包冲突" ; \
-    export CFLAGS="-O2 -fno-strict-aliasing -Wl,-rpath=$OPENSSL_INSTALL_PATH_PREFIX/lib"; \
-    \
-    : "=== JIT 仅在 x86_64 / aarch64 上受支持 ===" ; \
-    jitFlag=; \
-    case "$(uname -m)" in \
-        x86_64 | aarch64) jitFlag='--enable-jit' ;; \
-    esac; \
-    \
-    ./configure \
-        --prefix="$ERLANG_INSTALL_PATH_PREFIX" \
-        --disable-hipe \
-        --disable-sctp \
-        --disable-silent-rules \
-        --enable-builtin-zlib \
-        --enable-clock-gettime \
-        --enable-hybrid-heap \
-        --enable-kernel-poll \
-        --enable-smp-support \
-        --enable-threads \
-        --with-microstate-accounting=extra \
-        --with-ssl="$OPENSSL_INSTALL_PATH_PREFIX" \
-        --without-common_test \
-        --without-debugger \
-        --without-dialyzer \
-        --without-diameter \
-        --without-edoc \
-        --without-erl_docgen \
-        --without-et \
-        --without-eunit \
-        --without-ftp \
-        --without-hipe \
-        --without-jinterface \
-        --without-megaco \
-        --without-observer \
-        --without-odbc \
-        --without-reltool \
-        --without-snmp \
-        --without-ssh \
-        --without-tftp \
-        --without-wx \
-        $jitFlag \
-    ; \
-    \
-    : "=== 编译并安装 ===" ; \
-    make -j "$(getconf _NPROCESSORS_ONLN)" GEN_OPT_FLGS="-O2 -fno-strict-aliasing"; \
-    make install; \
-    \
-    : "=== 删除无用文件减小体积 ===" ; \
-    find "$ERLANG_INSTALL_PATH_PREFIX/lib/erlang" -type d -name examples -exec rm -rf '{}' +; \
-    find "$ERLANG_INSTALL_PATH_PREFIX/lib/erlang" -type d -name src -exec rm -rf '{}' +; \
-    find "$ERLANG_INSTALL_PATH_PREFIX/lib/erlang" -type d -name include -exec rm -rf '{}' +;
-
-# 校验 crypto/ssl 确实链接到 /opt/openssl 而非系统 libssl
-ENV PATH=$ERLANG_INSTALL_PATH_PREFIX/bin:$PATH
-RUN set -eux; \
-    find $ERLANG_INSTALL_PATH_PREFIX -type f -name 'crypto.so' -exec ldd {} \; | grep -F "$OPENSSL_INSTALL_PATH_PREFIX/lib"; \
-    erl -noshell -eval 'ok = crypto:start(), ok = io:format("~p~n~n~p~n~n", [crypto:supports(), ssl:versions()]), init:stop().'
-
-############################################
-# runtime: 最终运行镜像
-############################################
-
-FROM ghcr.io/blueapple168/${BASE_IMAGE_TAG}
-
-ARG RABBITMQ_VERSION
-ARG OTP_VERSION
-ARG GOSU_VERSION
-ARG RABBITMQADMIN_VERSION
-
-LABEL maintainer="blueapple" \
-        version="1.0" \
-        description="RabbitMQ ${RABBITMQ_VERSION} (management) with Erlang/OTP ${OTP_VERSION} on UOS 1070a" \
-        org.opencontainers.image.base.name="registry.uniontech.com/uos-server-base/uos-server-20-1070a:latest" \
-        org.opencontainers.image.title="RabbitMQ" \
-        org.opencontainers.image.version="${RABBITMQ_VERSION}"
-
-ENV TZ=Asia/Shanghai
-
-RUN set -eux; \
-    echo "${TZ}" > /etc/timezone; \
-    sed -i 's/\$StateMode/ufu/g' /etc/yum.repos.d/UnionTechOS.repo; \
-    sed -i 's/Version: 39\.2\.0/Version: 2026\.10\.08/g' /usr/lib/python3.6/site-packages/setuptools-39.2.0.dist-info/METADATA 2>/dev/null || true; \
-    \
-    : "=== yum/dnf 网络调优（与 build-base 相同） ===" ; \
-    if [ -f /etc/yum.conf ]; then \
-        sed -i '/^[ \t]*\(timeout\|minrate\|retries\)=/d' /etc/yum.conf 2>/dev/null || true; \
-        if grep -q '^\[main\]' /etc/yum.conf; then \
-            sed -i '/^\[main\]/a timeout=300\nminrate=100\nretries=10' /etc/yum.conf; \
-        else \
-            printf '\n[main]\ntimeout=300\nminrate=100\nretries=10\n' >> /etc/yum.conf; \
-        fi; \
-    fi; \
-    yum makecache; \
-    \
-    : "=== 运行时依赖：ca-certificates (TLS)、tzdata (时区)、xz (解压 RabbitMQ 发行包) ===" ; \
-    yum install -y --setopt=install_weak_deps=false --nogpgcheck --nodocs \
-        --setopt=timeout=300 --setopt=minrate=100 \
-        ca-certificates tzdata xz; \
+        ca-certificates tar tzdata xz wget curl procps; \
     \
     yum clean all; \
     rm -rf /var/cache/yum /var/cache/dnf
 
-# OPENSSL/ERLANG_INSTALL_PATH_PREFIX 定义在前面的阶段，此处重新定义
-ENV ERLANG_INSTALL_PATH_PREFIX=/opt/erlang
-ENV OPENSSL_INSTALL_PATH_PREFIX=/opt/openssl
+############################################
+# 安装 Erlang/OTP: RabbitMQ 官方团队维护的零依赖 RPM
+# https://github.com/rabbitmq/erlang-rpm/releases
+# el8 对应 UOS Server 20 (RHEL 8 兼容, glibc 2.28)
+# RPM 自带 OpenSSL 运行时，无需源码编译 OpenSSL/Erlang
+############################################
 
-COPY --from=erlang-builder $ERLANG_INSTALL_PATH_PREFIX $ERLANG_INSTALL_PATH_PREFIX
-COPY --from=openssl-builder $OPENSSL_INSTALL_PATH_PREFIX $OPENSSL_INSTALL_PATH_PREFIX
+ENV ERLANG_RPM_BASE_URL=https://github.com/rabbitmq/erlang-rpm/releases/download/v${OTP_VERSION}
+ENV ERLANG_RPM_VERSION=${OTP_VERSION}
 
-ENV PATH=$ERLANG_INSTALL_PATH_PREFIX/bin:$OPENSSL_INSTALL_PATH_PREFIX/bin:$PATH
+RUN set -eux; \
+    : "=== 架构映射: x86_64/aarch64 对应 erlang-rpm 的 el8 资产及其官方 SHA256 ===" ; \
+    case "$(uname -m)" in \
+        x86_64)  rpmArch='x86_64';   rpmSha="${ERLANG_RPM_SHA256_X86_64}" ;; \
+        aarch64) rpmArch='aarch64';   rpmSha="${ERLANG_RPM_SHA256_AARCH64}" ;; \
+        *) echo >&2 "error: unsupported arch: '$(uname -m)'"; exit 1 ;; \
+    esac; \
+    ERLANG_RPM="erlang-${ERLANG_RPM_VERSION}-1.el8.${rpmArch}.rpm"; \
+    ERLANG_RPM_URL="${ERLANG_RPM_BASE_URL}/${ERLANG_RPM}"; \
+    \
+    wget --progress dot:giga --output-document "/tmp/${ERLANG_RPM}" "$ERLANG_RPM_URL"; \
+    \
+    : "=== SHA256 校验: 摘要来自 rabbitmq/erlang-rpm release 官方元数据 (无 .asc 资产，这是官方提供的唯一校验手段) ===" ; \
+    echo "${rpmSha}  /tmp/${ERLANG_RPM}" | sha256sum --check --strict -; \
+    \
+    : "=== localinstall: 自动解析依赖并安装 (rpm -ivh 不会处理缺失依赖) ===" ; \
+    yum localinstall -y --setopt=install_weak_deps=false --nogpgcheck --nodocs "/tmp/${ERLANG_RPM}"; \
+    rm -f "/tmp/${ERLANG_RPM}"; \
+    \
+    : "=== 冒烟测试: erlang-rpm 安装到 /usr/lib64/erlang, /usr/bin/erl 由 RPM 软链提供 ===" ; \
+    command -v erl; \
+    erl -noshell -eval 'case crypto:start() of ok -> io:format("crypto started ok\n"); {error,E} -> io:format("crypto start ERROR ~p\n",[E]), halt(1) end, init:stop().'
+
+############################################
+# 创建 rabbitmq 系统用户/组、目录结构
+############################################
 
 ENV RABBITMQ_DATA_DIR=/var/lib/rabbitmq
 
 RUN set -eux; \
-    : "=== 配置 OpenSSL 使用系统 CA 证书（修复原ln多源参数错误） ===" ; \
-    rm -rf "$OPENSSL_INSTALL_PATH_PREFIX/etc/ssl/certs"; \
-    ln -vsf /etc/ssl/certs       "$OPENSSL_INSTALL_PATH_PREFIX/etc/ssl/certs"; \
-    rm -rf "$OPENSSL_INSTALL_PATH_PREFIX/etc/ssl/private"; \
-    ln -vsf /etc/ssl/private     "$OPENSSL_INSTALL_PATH_PREFIX/etc/ssl/private"; \
-    ldconfig; \
-    \
-    : "=== FIPS 相关配置（与官方一致） ===" ; \
-    sed -i.ORIG -e "/\.include.*fips/ s!.*!.include $OPENSSL_INSTALL_PATH_PREFIX/etc/ssl/fipsmodule.cnf!" \
-        -e '/# fips =/s/.*$/fips = fips_sect/' "$OPENSSL_INSTALL_PATH_PREFIX/etc/ssl/openssl.cnf"; \
-    sed -i.ORIG -e '/^activate/s/^/#/' "$OPENSSL_INSTALL_PATH_PREFIX/etc/ssl/fipsmodule.cnf"; \
-    \
-    : "=== 校验 OpenSSL/Erlang 拷贝后仍可用（移除ok=强断言，避免BEAM直接exit4崩溃） ===" ; \
-    "$OPENSSL_INSTALL_PATH_PREFIX/bin/openssl" version; \
-    "$OPENSSL_INSTALL_PATH_PREFIX/bin/openssl" version -d; \
-    erl -noshell -eval 'case crypto:start() of ok -> io:format("crypto started ok\n"); {error,E} -> io:format("crypto start ERROR ~p\n",[E]) end, io:format("~p~n~n~p~n~n", [crypto:supports(), ssl:versions()]), init:stop().'; \
-    \
     : "=== 创建 rabbitmq 系统用户/组 ===" ; \
     groupadd --gid 999 --system rabbitmq; \
     useradd --uid 999 --system --home-dir "$RABBITMQ_DATA_DIR" --gid rabbitmq rabbitmq; \
@@ -306,20 +145,43 @@ RUN set -eux; \
     : "=== 验证 gosu 可用 ===" ; \
     gosu nobody true;
 
+############################################
+# 安装 RabbitMQ: 官方通用二进制包 (标准工具链版)
+# https://www.rabbitmq.com/docs/install-generic-unix
+# 标准版而非 latest-toolchain: 标准版面向老 glibc 环境构建，
+# 与 erlang-rpm 为 RHEL8 标准环境构建的 OTP 27 是官方推荐组合
+############################################
+
 ENV RABBITMQ_VERSION=${RABBITMQ_VERSION}
+ENV RABBITMQ_PGP_KEY_ID=0x0A9AF2115F4687BD29803A206B73A36E6026DFCA
 ENV RABBITMQ_HOME=/opt/rabbitmq
 ENV PATH=$RABBITMQ_HOME/sbin:$PATH
 
 RUN set -eux; \
-    RABBITMQ_SOURCE_URL="https://github.com/rabbitmq/rabbitmq-server/releases/download/v$RABBITMQ_VERSION/rabbitmq-server-generic-unix-latest-toolchain-$RABBITMQ_VERSION.tar.xz"; \
+    RABBITMQ_SOURCE_URL="https://github.com/rabbitmq/rabbitmq-server/releases/download/v$RABBITMQ_VERSION/rabbitmq-server-generic-unix-$RABBITMQ_VERSION.tar.xz"; \
     RABBITMQ_PATH="/usr/local/src/rabbitmq-$RABBITMQ_VERSION"; \
     \
-    : "=== 下载并解压 RabbitMQ 通用二进制包（latest-toolchain 需 OTP 26+，与上面自编的 OTP 27 匹配） ===" ; \
-    wget --progress dot:giga --output-document "$RABBITMQ_PATH.tar.xz" "$RABBITMQ_SOURCE_URL"; \
+    : "=== 临时安装 gnupg2 用于 PGP 签名校验，同层结束前卸载，不增加镜像体积 ===" ; \
+    yum install -y --setopt=install_weak_deps=false --nogpgcheck --nodocs gnupg2; \
     \
+    : "=== 下载 tar.xz 与官方 .asc PGP 签名文件 ===" ; \
+    wget --progress dot:giga --output-document "$RABBITMQ_PATH.tar.xz" "$RABBITMQ_SOURCE_URL"; \
+    wget --progress dot:giga --output-document "$RABBITMQ_PATH.tar.xz.asc" "$RABBITMQ_SOURCE_URL.asc"; \
+    \
+    : "=== PGP 签名校验: 导入 RabbitMQ 官方签名密钥并验证 tar.xz (与官方 alpine/ubuntu Dockerfile 一致) ===" ; \
+    export GNUPGHOME="$(mktemp -d)"; \
+    gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys "$RABBITMQ_PGP_KEY_ID"; \
+    gpg --batch --verify "$RABBITMQ_PATH.tar.xz.asc" "$RABBITMQ_PATH.tar.xz"; \
+    gpgconf --kill all; \
+    rm -rf "$GNUPGHOME"; \
+    \
+    : "=== 解压 RabbitMQ 通用二进制包 (标准工具链版) ===" ; \
     mkdir -p "$RABBITMQ_HOME"; \
     tar --extract --file "$RABBITMQ_PATH.tar.xz" --directory "$RABBITMQ_HOME" --strip-components 1; \
     rm -rf "$RABBITMQ_PATH"*; \
+    \
+    : "=== 卸载 gnupg2 (校验已完成) ===" ; \
+    yum remove -y --setopt=install_weak_deps=false gnupg2; \
     \
     : "=== 不默认将 SYS_PREFIX 指向 RABBITMQ_HOME，保持为空（官方行为） ===" ; \
     grep -qE '^SYS_PREFIX=\$\{RABBITMQ_HOME\}$' "$RABBITMQ_HOME/sbin/rabbitmq-defaults"; \
@@ -334,7 +196,7 @@ RUN set -eux; \
     gosu rabbitmq rabbitmqctl list_ciphers; \
     gosu rabbitmq rabbitmq-plugins list; \
     : "=== 无残留 cookie ===" ; \
-    rm "$RABBITMQ_DATA_DIR/.erlang.cookie";
+    rm -f "$RABBITMQ_DATA_DIR/.erlang.cookie"
 
 # 默认启用 Prometheus 风格指标 (https://github.com/docker-library/rabbitmq/issues/419)
 RUN gosu rabbitmq rabbitmq-plugins enable --offline rabbitmq_prometheus
@@ -384,7 +246,6 @@ ENV RUNNING_UNDER_SYSTEMD=true
 
 COPY --chown=rabbitmq:rabbitmq 10-defaults.conf 20-management_agent.disable_metrics_collector.conf /etc/rabbitmq/conf.d/
 COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/
-# RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 ENTRYPOINT ["docker-entrypoint.sh"]
 
