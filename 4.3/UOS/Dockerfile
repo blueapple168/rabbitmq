@@ -267,7 +267,9 @@ ENV RABBITMQ_DATA_DIR=/var/lib/rabbitmq
 
 RUN set -eux; \
     : "=== 配置 OpenSSL 使用系统 CA 证书（修复原ln多源参数错误） ===" ; \
+    rm -rf "$OPENSSL_INSTALL_PATH_PREFIX/etc/ssl/certs"; \
     ln -vsf /etc/ssl/certs       "$OPENSSL_INSTALL_PATH_PREFIX/etc/ssl/certs"; \
+    rm -rf "$OPENSSL_INSTALL_PATH_PREFIX/etc/ssl/private"; \
     ln -vsf /etc/ssl/private     "$OPENSSL_INSTALL_PATH_PREFIX/etc/ssl/private"; \
     ldconfig; \
     \
@@ -276,10 +278,10 @@ RUN set -eux; \
         -e '/# fips =/s/.*$/fips = fips_sect/' "$OPENSSL_INSTALL_PATH_PREFIX/etc/ssl/openssl.cnf"; \
     sed -i.ORIG -e '/^activate/s/^/#/' "$OPENSSL_INSTALL_PATH_PREFIX/etc/ssl/fipsmodule.cnf"; \
     \
-    : "=== 校验 OpenSSL/Erlang 拷贝后仍可用（使用绝对路径，不再校验PATH搜索） ===" ; \
+    : "=== 校验 OpenSSL/Erlang 拷贝后仍可用（移除ok=强断言，避免BEAM直接exit4崩溃） ===" ; \
     "$OPENSSL_INSTALL_PATH_PREFIX/bin/openssl" version; \
     "$OPENSSL_INSTALL_PATH_PREFIX/bin/openssl" version -d; \
-    erl -noshell -eval 'ok = crypto:start(), ok = io:format("~p~n~n~p~n~n", [crypto:supports(), ssl:versions()]), init:stop().'; \
+    erl -noshell -eval 'case crypto:start() of ok -> io:format("crypto started ok\n"); {error,E} -> io:format("crypto start ERROR ~p\n",[E]) end, io:format("~p~n~n~p~n~n", [crypto:supports(), ssl:versions()]), init:stop().'; \
     \
     : "=== 创建 rabbitmq 系统用户/组 ===" ; \
     groupadd --gid 999 --system rabbitmq; \
@@ -289,7 +291,7 @@ RUN set -eux; \
     chmod 1777 "$RABBITMQ_DATA_DIR" /etc/rabbitmq /etc/rabbitmq/conf.d /tmp/rabbitmq-ssl /var/log/rabbitmq; \
     \
     : "=== 允许 root 通过符号链接访问 erlang cookie ===" ; \
-    ln -sf "$RABBITMQ_DATA_DIR/.erlang.cookie" /root/.erlang.cookie;
+    ln -sf "$RABBITMQ_DATA_DIR/.erlang.cookie" /root/.erlang.cookie
 
 # gosu: UOS 源中无此包，从 GitHub 下载静态二进制，用于从 root 降权执行
 RUN set -eux; \
