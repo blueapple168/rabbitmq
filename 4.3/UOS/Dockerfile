@@ -23,8 +23,11 @@
 #      启用 rabbitmq_management 插件、恢复 metrics collector、安装 rabbitmqadmin
 #
 # 构建流程 (单阶段):
-#   yum 调优 -> 安装 erlang RPM (零依赖) -> 创建 rabbitmq 用户/目录 -> gosu
-#   -> 解压 rabbitmq-server-generic-unix tar.xz -> 冒烟测试 -> 启用插件 -> rabbitmqadmin
+#   RUN#1 单次 yum 会话: yum 调优 + 运行时依赖(含 gnupg2) + erlang RPM (SHA256 校验) + 冒烟测试 + 清理
+#   -> 创建 rabbitmq 用户/目录 -> gosu
+#   -> 解压 rabbitmq-server-generic-unix tar.xz (.asc PGP 签名校验 + 冒烟测试)
+#   -> 启用插件 -> rabbitmqadmin
+# (每个独立 RUN 调 yum 都会重新下载全部仓库元数据，故 yum 操作合并进 RUN#1)
 
 ARG RABBITMQ_VERSION=4.3.6
 ARG OTP_VERSION=27.3.4.18
@@ -59,6 +62,14 @@ LABEL maintainer="blueapple" \
 
 ENV TZ=Asia/Shanghai
 
+# Erlang RPM 来源: RabbitMQ 官方团队维护的零依赖包 (自带 OpenSSL 运行时)
+# el8 对应 UOS Server 20 (RHEL 8 兼容, glibc 2.28)，无需源码编译 OpenSSL/Erlang
+ENV ERLANG_RPM_BASE_URL=https://github.com/rabbitmq/erlang-rpm/releases/download/v${OTP_VERSION}
+ENV ERLANG_RPM_VERSION=${OTP_VERSION}
+
+# yum 相关操作 (调优/makecache/装依赖/装 erlang RPM) 合并在单个 RUN 中:
+# 每个独立 RUN 调用 yum 都要重新下载全部仓库元数据 (UOS 全部仓库约 60s/次)，
+# 拆成多个 RUN 会导致元数据重复下载，拉长构建时间并增大被取消/超时的暴露窗口
 RUN set -eux; \
     echo "${TZ}" > /etc/timezone; \
     sed -i 's/\$StateMode/ufu/g' /etc/yum.repos.d/UnionTechOS.repo; \
@@ -78,26 +89,12 @@ RUN set -eux; \
     : "=== 运行时依赖：ca-certificates (TLS)、tzdata (时区)、xz (解压 RabbitMQ 发行包)、wget/curl (下载)、procps (rabbitmqctl wait 需要 ps) ===" ; \
     yum install -y --setopt=install_weak_deps=false --nogpgcheck --nodocs \
         --setopt=timeout=300 --setopt=minrate=100 \
-        ca-certificates tar tzdata xz wget curl procps; \
+        ca-certificates tar tzdata xz wget curl procps gnupg2; \
     \
-    yum clean all; \
-    rm -rf /var/cache/yum /var/cache/dnf
-
-############################################
-# 安装 Erlang/OTP: RabbitMQ 官方团队维护的零依赖 RPM
-# https://github.com/rabbitmq/erlang-rpm/releases
-# el8 对应 UOS Server 20 (RHEL 8 兼容, glibc 2.28)
-# RPM 自带 OpenSSL 运行时，无需源码编译 OpenSSL/Erlang
-############################################
-
-ENV ERLANG_RPM_BASE_URL=https://github.com/rabbitmq/erlang-rpm/releases/download/v${OTP_VERSION}
-ENV ERLANG_RPM_VERSION=${OTP_VERSION}
-
-RUN set -eux; \
-    : "=== 架构映射: x86_64/aarch64 对应 erlang-rpm 的 el8 资产及其官方 SHA256 ===" ; \
+    : "=== 下载 erlang-rpm 并按架构映射官方 SHA256 (x86_64/aarch64 对应 el8 资产) ===" ; \
     case "$(uname -m)" in \
         x86_64)  rpmArch='x86_64';   rpmSha="${ERLANG_RPM_SHA256_X86_64}" ;; \
-        aarch64) rpmArch='aarch64';   rpmSha="${ERLANG_RPM_SHA256_AARCH64}" ;; \
+        aarch64) rpmArch='aarch64';  rpmSha="${ERLANG_RPM_SHA256_AARCH64}" ;; \
         *) echo >&2 "error: unsupported arch: '$(uname -m)'"; exit 1 ;; \
     esac; \
     ERLANG_RPM="erlang-${ERLANG_RPM_VERSION}-1.el8.${rpmArch}.rpm"; \
@@ -114,7 +111,10 @@ RUN set -eux; \
     \
     : "=== 冒烟测试: erlang-rpm 安装到 /usr/lib64/erlang, /usr/bin/erl 由 RPM 软链提供 ===" ; \
     command -v erl; \
-    erl -noshell -eval 'case crypto:start() of ok -> io:format("crypto started ok\n"); {error,E} -> io:format("crypto start ERROR ~p\n",[E]), halt(1) end, init:stop().'
+    erl -noshell -eval 'case crypto:start() of ok -> io:format("crypto started ok\n"); {error,E} -> io:format("crypto start ERROR ~p\n",[E]), halt(1) end, init:stop().'; \
+    \
+    yum clean all; \
+    rm -rf /var/cache/yum /var/cache/dnf
 
 ############################################
 # 创建 rabbitmq 系统用户/组、目录结构
@@ -123,9 +123,23 @@ RUN set -eux; \
 ENV RABBITMQ_DATA_DIR=/var/lib/rabbitmq
 
 RUN set -eux; \
-    : "=== 创建 rabbitmq 系统用户/组 ===" ; \
-    groupadd --gid 999 --system rabbitmq; \
-    useradd --uid 999 --system --home-dir "$RABBITMQ_DATA_DIR" --gid rabbitmq rabbitmq; \
+    : "=== 创建 rabbitmq 系统用户/组 (幂等: 官方固定 ID 999 被基础镜像占用时回退为系统自动分配) ===" ; \
+    if ! getent group rabbitmq >/dev/null; then \
+        if getent group 999 >/dev/null; then \
+            echo "::notice GID 999 已被基础镜像占用 ($(getent group 999))，改用系统自动分配 GID"; \
+            groupadd --system rabbitmq; \
+        else \
+            groupadd --gid 999 --system rabbitmq; \
+        fi; \
+    fi; \
+    if ! id rabbitmq >/dev/null 2>&1; then \
+        if id -u 999 >/dev/null 2>&1; then \
+            echo "::notice UID 999 已被基础镜像占用 ($(id -nu 999))，改用系统自动分配 UID"; \
+            useradd --system --home-dir "$RABBITMQ_DATA_DIR" --gid rabbitmq rabbitmq; \
+        else \
+            useradd --uid 999 --system --home-dir "$RABBITMQ_DATA_DIR" --gid rabbitmq rabbitmq; \
+        fi; \
+    fi; \
     mkdir -p "$RABBITMQ_DATA_DIR" /etc/rabbitmq /etc/rabbitmq/conf.d /tmp/rabbitmq-ssl /var/log/rabbitmq; \
     chown -fR rabbitmq:rabbitmq "$RABBITMQ_DATA_DIR" /etc/rabbitmq /etc/rabbitmq/conf.d /tmp/rabbitmq-ssl /var/log/rabbitmq; \
     chmod 1777 "$RABBITMQ_DATA_DIR" /etc/rabbitmq /etc/rabbitmq/conf.d /tmp/rabbitmq-ssl /var/log/rabbitmq; \
@@ -162,9 +176,6 @@ RUN set -eux; \
     RABBITMQ_SOURCE_URL="https://github.com/rabbitmq/rabbitmq-server/releases/download/v$RABBITMQ_VERSION/rabbitmq-server-generic-unix-$RABBITMQ_VERSION.tar.xz"; \
     RABBITMQ_PATH="/usr/local/src/rabbitmq-$RABBITMQ_VERSION"; \
     \
-    : "=== 临时安装 gnupg2 用于 PGP 签名校验，同层结束前卸载，不增加镜像体积 ===" ; \
-    yum install -y --setopt=install_weak_deps=false --nogpgcheck --nodocs gnupg2; \
-    \
     : "=== 下载 tar.xz 与官方 .asc PGP 签名文件 ===" ; \
     wget --progress dot:giga --output-document "$RABBITMQ_PATH.tar.xz" "$RABBITMQ_SOURCE_URL"; \
     wget --progress dot:giga --output-document "$RABBITMQ_PATH.tar.xz.asc" "$RABBITMQ_SOURCE_URL.asc"; \
@@ -181,8 +192,8 @@ RUN set -eux; \
     tar --extract --file "$RABBITMQ_PATH.tar.xz" --directory "$RABBITMQ_HOME" --strip-components 1; \
     rm -rf "$RABBITMQ_PATH"*; \
     \
-    : "=== 卸载 gnupg2 (校验已完成) ===" ; \
-    yum remove -y --setopt=install_weak_deps=false gnupg2; \
+    : "=== 卸载 gnupg2 (校验已完成; 用 rpm -e 避免 yum 再拉一次仓库元数据; 失败仅提示不阻断) ===" ; \
+    rpm -e gnupg2 2>/dev/null || echo "Notice: gnupg2 was not removed (可能被基础镜像预装且被依赖)"; \
     \
     : "=== 不默认将 SYS_PREFIX 指向 RABBITMQ_HOME，保持为空（官方行为） ===" ; \
     grep -qE '^SYS_PREFIX=\$\{RABBITMQ_HOME\}$' "$RABBITMQ_HOME/sbin/rabbitmq-defaults"; \
