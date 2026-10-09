@@ -45,20 +45,20 @@ RUN set -eux; \
     \
     : "=== yum/dnf 网络调优：默认 timeout=30s 太短，minrate=1000 容易在低速链路上触发下载中止；延长超时到 300s、降低低速阈值到 100 B/s、retries=10 ===" ; \
     if [ -f /etc/yum.conf ]; then \
-        sed -i '/^[ \t]*\(timeout\|minrate\|retries\)=/d' /etc/yum.conf 2>/dev/null || true; \
-        if grep -q '^\[main\]' /etc/yum.conf; then \
-            sed -i '/^\[main\]/a timeout=300\nminrate=100\nretries=10' /etc/yum.conf; \
-        else \
-            printf '\n[main]\ntimeout=300\nminrate=100\nretries=10\n' >> /etc/yum.conf; \
-        fi; \
+      sed -i '/^\[ \t]*\(timeout\|minrate\|retries\)=/d' /etc/yum.conf 2>/dev/null || true; \
+      if grep -q '^\[main\]' /etc/yum.conf; then \
+        sed -i '/^\[main\]/a timeout=300\nminrate=100\nretries=10' /etc/yum.conf; \
+      else \
+        printf '\n[main]\ntimeout=300\nminrate=100\nretries=10\n' >> /etc/yum.conf; \
+      fi; \
     fi; \
     yum makecache; \
     \
     : "=== 编译依赖：gcc/perl/make 编 OpenSSL + Erlang/OTP；perl-IPC-Cmd 是 OpenSSL Configure 必需 ===" ; \
     yum install -y --setopt=install_weak_deps=false --nogpgcheck --nodocs \
-        --setopt=timeout=300 --setopt=minrate=100 \
-        tar gzip xz wget curl ca-certificates make gcc gcc-c++ glibc-devel \
-        ncurses-devel perl perl-IPC-Cmd;
+      --setopt=timeout=300 --setopt=minrate=100 \
+      tar gzip xz wget curl ca-certificates make gcc gcc-c++ glibc-devel \
+      ncurses-devel perl perl-IPC-Cmd;
 
 ############################################
 # openssl-builder: 编译 OpenSSL 到 /opt/openssl
@@ -91,9 +91,9 @@ RUN set -eux; \
     \
     : "=== 架构映射: dpkg -> uname -m ===" ; \
     case "$(uname -m)" in \
-        x86_64)  opensslMachine='linux-x86_64' ;; \
-        aarch64) opensslMachine='linux-aarch64' ;; \
-        *) echo >&2 "error: unsupported arch: '$(uname -m)'"; exit 1 ;; \
+      x86_64)  opensslMachine='linux-x86_64' ;; \
+      aarch64) opensslMachine='linux-aarch64' ;; \
+      *) echo >&2 "error: unsupported arch: '$(uname -m)'"; exit 1 ;; \
     esac; \
     \
     cd "$OPENSSL_PATH"; \
@@ -102,13 +102,13 @@ RUN set -eux; \
     SYSTEM='Linux' \
     BUILD='???' \
     ./Configure \
-        "$opensslMachine" \
-        shared \
-        enable-fips \
-        --prefix="$OPENSSL_INSTALL_PATH_PREFIX" \
-        --openssldir="$OPENSSL_CONFIG_DIR" \
-        --libdir="$OPENSSL_INSTALL_PATH_PREFIX/lib" \
-        -Wl,-rpath="$OPENSSL_INSTALL_PATH_PREFIX/lib" \
+      "$opensslMachine" \
+      shared \
+      enable-fips \
+      --prefix="$OPENSSL_INSTALL_PATH_PREFIX" \
+      --openssldir="$OPENSSL_CONFIG_DIR" \
+      --libdir="$OPENSSL_INSTALL_PATH_PREFIX/lib" \
+      -Wl,-rpath="$OPENSSL_INSTALL_PATH_PREFIX/lib" \
     ; \
     \
     : "=== 编译并安装 OpenSSL ===" ; \
@@ -116,9 +116,10 @@ RUN set -eux; \
     make install_sw install_ssldirs install_fips; \
     ldconfig; \
     \
-    : "=== 使用系统的 CA 证书 ===" ; \
+    : "=== 使用系统的 CA 证书（修复原ln多源参数错误） ===" ; \
     rmdir "$OPENSSL_CONFIG_DIR/certs" "$OPENSSL_CONFIG_DIR/private"; \
-    ln -sf /etc/ssl/certs /etc/ssl/private "$OPENSSL_CONFIG_DIR";
+    ln -sf /etc/ssl/certs      "$OPENSSL_CONFIG_DIR/certs"; \
+    ln -sf /etc/ssl/private    "$OPENSSL_CONFIG_DIR/private";
 
 # 冒烟测试
 RUN $OPENSSL_INSTALL_PATH_PREFIX/bin/openssl version
@@ -155,42 +156,42 @@ RUN set -eux; \
     : "=== JIT 仅在 x86_64 / aarch64 上受支持 ===" ; \
     jitFlag=; \
     case "$(uname -m)" in \
-        x86_64 | aarch64) jitFlag='--enable-jit' ;; \
+      x86_64 | aarch64) jitFlag='--enable-jit' ;; \
     esac; \
     \
     ./configure \
-        --prefix="$ERLANG_INSTALL_PATH_PREFIX" \
-        --disable-hipe \
-        --disable-sctp \
-        --disable-silent-rules \
-        --enable-builtin-zlib \
-        --enable-clock-gettime \
-        --enable-hybrid-heap \
-        --enable-kernel-poll \
-        --enable-smp-support \
-        --enable-threads \
-        --with-microstate-accounting=extra \
-        --with-ssl="$OPENSSL_INSTALL_PATH_PREFIX" \
-        --without-common_test \
-        --without-debugger \
-        --without-dialyzer \
-        --without-diameter \
-        --without-edoc \
-        --without-erl_docgen \
-        --without-et \
-        --without-eunit \
-        --without-ftp \
-        --without-hipe \
-        --without-jinterface \
-        --without-megaco \
-        --without-observer \
-        --without-odbc \
-        --without-reltool \
-        --without-snmp \
-        --without-ssh \
-        --without-tftp \
-        --without-wx \
-        $jitFlag \
+      --prefix="$ERLANG_INSTALL_PATH_PREFIX" \
+      --disable-hipe \
+      --disable-sctp \
+      --disable-silent-rules \
+      --enable-builtin-zlib \
+      --enable-clock-gettime \
+      --enable-hybrid-heap \
+      --enable-kernel-poll \
+      --enable-smp-support \
+      --enable-threads \
+      --with-microstate-accounting=extra \
+      --with-ssl="$OPENSSL_INSTALL_PATH_PREFIX" \
+      --without-common_test \
+      --without-debugger \
+      --without-dialyzer \
+      --without-diameter \
+      --without-edoc \
+      --without-erl_docgen \
+      --without-et \
+      --without-eunit \
+      --without-ftp \
+      --without-hipe \
+      --without-jinterface \
+      --without-megaco \
+      --without-observer \
+      --without-odbc \
+      --without-reltool \
+      --without-snmp \
+      --without-ssh \
+      --without-tftp \
+      --without-wx \
+      $jitFlag \
     ; \
     \
     : "=== 编译并安装 ===" ; \
@@ -215,6 +216,7 @@ RUN set -eux; \
 FROM ghcr.io/blueapple168/${BASE_IMAGE_TAG}
 
 ARG RABBITMQ_VERSION
+ARG OTP_VERSION
 ARG GOSU_VERSION
 ARG RABBITMQADMIN_VERSION
 
@@ -234,19 +236,19 @@ RUN set -eux; \
     \
     : "=== yum/dnf 网络调优（与 build-base 相同） ===" ; \
     if [ -f /etc/yum.conf ]; then \
-        sed -i '/^[ \t]*\(timeout\|minrate\|retries\)=/d' /etc/yum.conf 2>/dev/null || true; \
-        if grep -q '^\[main\]' /etc/yum.conf; then \
-            sed -i '/^\[main\]/a timeout=300\nminrate=100\nretries=10' /etc/yum.conf; \
-        else \
-            printf '\n[main]\ntimeout=300\nminrate=100\nretries=10\n' >> /etc/yum.conf; \
-        fi; \
+      sed -i '/^\[ \t]*\(timeout\|minrate\|retries\)=/d' /etc/yum.conf 2>/dev/null || true; \
+      if grep -q '^\[main\]' /etc/yum.conf; then \
+        sed -i '/^\[main\]/a timeout=300\nminrate=100\nretries=10' /etc/yum.conf; \
+      else \
+        printf '\n[main]\ntimeout=300\nminrate=100\nretries=10\n' >> /etc/yum.conf; \
+      fi; \
     fi; \
     yum makecache; \
     \
     : "=== 运行时依赖：ca-certificates (TLS)、tzdata (时区)、xz (解压 RabbitMQ 发行包) ===" ; \
     yum install -y --setopt=install_weak_deps=false --nogpgcheck --nodocs \
-        --setopt=timeout=300 --setopt=minrate=100 \
-        ca-certificates tzdata xz; \
+      --setopt=timeout=300 --setopt=minrate=100 \
+      ca-certificates tzdata xz; \
     \
     yum clean all; \
     rm -rf /var/cache/yum /var/cache/dnf
@@ -263,13 +265,14 @@ ENV PATH=$ERLANG_INSTALL_PATH_PREFIX/bin:$OPENSSL_INSTALL_PATH_PREFIX/bin:$PATH
 ENV RABBITMQ_DATA_DIR=/var/lib/rabbitmq
 
 RUN set -eux; \
-    : "=== 配置 OpenSSL 使用系统 CA 证书 ===" ; \
-    ln -vsf /etc/ssl/certs /etc/ssl/private "$OPENSSL_INSTALL_PATH_PREFIX/etc/ssl"; \
+    : "=== 配置 OpenSSL 使用系统 CA 证书（修复原ln多源参数错误） ===" ; \
+    ln -vsf /etc/ssl/certs       "$OPENSSL_INSTALL_PATH_PREFIX/etc/ssl/certs"; \
+    ln -vsf /etc/ssl/private     "$OPENSSL_INSTALL_PATH_PREFIX/etc/ssl/private"; \
     ldconfig; \
     \
     : "=== FIPS 相关配置（与官方一致） ===" ; \
     sed -i.ORIG -e "/\.include.*fips/ s!.*!.include $OPENSSL_INSTALL_PATH_PREFIX/etc/ssl/fipsmodule.cnf!" \
-        -e '/# fips =/s/.*/fips = fips_sect/' "$OPENSSL_INSTALL_PATH_PREFIX/etc/ssl/openssl.cnf"; \
+        -e '/# fips =/s/.*$/fips = fips_sect/' "$OPENSSL_INSTALL_PATH_PREFIX/etc/ssl/openssl.cnf"; \
     sed -i.ORIG -e '/^activate/s/^/#/' "$OPENSSL_INSTALL_PATH_PREFIX/etc/ssl/fipsmodule.cnf"; \
     \
     : "=== 校验 OpenSSL/Erlang 拷贝后仍可用 ===" ; \
@@ -291,9 +294,9 @@ RUN set -eux; \
 # gosu: UOS 源中无此包，从 GitHub 下载静态二进制，用于从 root 降权执行
 RUN set -eux; \
     case "$(uname -m)" in \
-        x86_64)  gosuArch='amd64' ;; \
-        aarch64) gosuArch='arm64' ;; \
-        *) echo >&2 "error: unsupported arch: '$(uname -m)'"; exit 1 ;; \
+      x86_64)  gosuArch='amd64' ;; \
+      aarch64) gosuArch='arm64' ;; \
+      *) echo >&2 "error: unsupported arch: '$(uname -m)'"; exit 1 ;; \
     esac; \
     wget --progress dot:giga --output-document /usr/local/bin/gosu "https://github.com/tianon/gosu/releases/download/${GOSU_VERSION}/gosu-${gosuArch}"; \
     chmod +x /usr/local/bin/gosu; \
@@ -352,9 +355,9 @@ RUN set -eux; \
 # rabbitmqadmin (rabbitmqadmin-ng): 官方 CLI 管理工具，按架构从 GitHub 下载静态二进制
 RUN set -eux; \
     case "$(uname -m)" in \
-        x86_64)  adminArch='x86_64-unknown-linux-gnu' ;; \
-        aarch64) adminArch='aarch64-unknown-linux-gnu' ;; \
-        *) echo >&2 "[INFO] rabbitmqadmin is not available on $(uname -m) (yet?)"; exit 0 ;; \
+      x86_64)  adminArch='x86_64-unknown-linux-gnu' ;; \
+      aarch64) adminArch='aarch64-unknown-linux-gnu' ;; \
+      *) echo >&2 "[INFO] rabbitmqadmin is not available on $(uname -m) (yet?)"; exit 0 ;; \
     esac; \
     \
     wget --progress dot:giga --output-document /usr/local/bin/rabbitmqadmin \
