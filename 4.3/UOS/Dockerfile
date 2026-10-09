@@ -229,10 +229,12 @@ RUN set -eux; \
 # 因此本镜像不再放置该配置文件 (官方 management 变体是 build 后再 rm，单镜像直接省去)
 
 # rabbitmqadmin (rabbitmqadmin-ng): 官方 CLI 管理工具，按架构从 GitHub 下载静态二进制
+# 注意: 使用 musl 静态版而非 gnu 版 —— gnu 版需要 GLIBC 2.34+，UOS 20 (el8, glibc 2.28) 无法运行;
+#       musl 版为全静态链接，无任何 libc 运行时依赖
 RUN set -eux; \
     case "$(uname -m)" in \
-        x86_64)  adminArch='x86_64-unknown-linux-gnu' ;; \
-        aarch64) adminArch='aarch64-unknown-linux-gnu' ;; \
+        x86_64)  adminArch='x86_64-unknown-linux-musl' ;; \
+        aarch64) adminArch='aarch64-unknown-linux-musl' ;; \
         *) echo >&2 "[INFO] rabbitmqadmin is not available on $(uname -m) (yet?)"; exit 0 ;; \
     esac; \
     \
