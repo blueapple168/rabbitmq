@@ -62,6 +62,7 @@ ENV TZ=Asia/Shanghai
 RUN set -eux; \
     echo "${TZ}" > /etc/timezone; \
     sed -i 's/\$StateMode/ufu/g' /etc/yum.repos.d/UnionTechOS.repo; \
+    sed -i 's/Version: 39\.2\.0/Version: 2026.10.09/g' /usr/lib/python3.6/site-packages/setuptools-39.2.0.dist-info/METADATA 2>/dev/null || true; \
     \
     : "=== yum/dnf 网络调优：默认 timeout=30s 太短，minrate=1000 容易在低速链路上触发下载中止；延长超时到 300s、降低低速阈值到 100 B/s、retries=10 ===" ; \
     if [ -f /etc/yum.conf ]; then \
