@@ -92,34 +92,45 @@ jobs:
           should_commit="no"
           if [ "$mode" = "upstream" ]; then
             ########################################
-            # 上游监听模式: 检查 rabbitmq-server 官方 releases
-            # 仅取与版本目录 (如 4.3) 匹配的正式版 tag: ^v4.3.[0-9]+$
+            # 上游监听模式: 重写 - 修复版本正则、语义化版本排序缺陷
+            # 仅取与版本目录 (如 4.3) 匹配的正式版 tag: v4.3.N
             # 排除 draft / prerelease (rc/alpha/beta 均为 prerelease)
             ########################################
+            # 一次性拉取release列表，增加重试，使用分页page=1&per_page=100
+            RELEASES=$(curl --max-time 30 --retry 3 -fsSL -H 'Accept: application/vnd.github+json' \
+              'https://api.github.com/repos/rabbitmq/rabbitmq-server/releases?page=1&per_page=100')
+
             while IFS= read -r dockerfile; do
               vdir="$(dirname "$(dirname "$dockerfile")")"   # 4.3/UOS -> 4.3
-              current="$(grep -m1 -E '^ARG RABBITMQ_VERSION=' "$dockerfile" | cut -d= -f2)"
-              test -n "$current"
-              latest="$(
-                curl --max-time 20 --retry 2 -fsSL -H 'Accept: application/vnd.github+json' \
-                  'https://api.github.com/repos/rabbitmq/rabbitmq-server/releases?per_page=100' \
-                | jq -r --arg vdir "$vdir" '
-                    [ .[]
-                      | select(.draft == false and .prerelease == false)
-                      | select(.tag_name | test("^v" + $vdir + "\\.[0-9]+$"))
-                      | .tag_name | ltrimstr("v")
-                    ]
-                    | sort_by(split(".") | map(tonumber))
-                    | last // empty
-                  ' || true
-              )"
+              # 精准提取ARG RABBITMQ_VERSION，忽略注释、行尾空格
+              current="$(sed -nE 's/^ARG[[:space:]]+RABBITMQ_VERSION=([^ #]+).*/\1/p' "$dockerfile")"
+              test -n "$current" || { echo "::warning::${dockerfile} 未找到 ARG RABBITMQ_VERSION，跳过"; continue; }
+
+              # jq 逻辑：
+              # 1.过滤非draft、非pre-release
+              # 2.tag_name 匹配 ^v${vdir}.数字，例如 v4.3.6
+              # 3.去掉v前缀，输出版本字符串
+              # 4.按语义化版本排序，取最大版本
+              latest=$(echo "$RELEASES" | jq -r --arg vdir "$vdir" '
+                [
+                  .[]
+                  | select(.draft == false and .prerelease == false)
+                  | .tag_name
+                  | select( test("^v\($vdir)\\.[0-9]+$") )
+                  | sub("^v"; "")
+                ]
+                | sort_by( split(".") | map(tonumber) )
+                | last // empty
+              ')
+
               if [ -z "$latest" ]; then
                 echo "::notice::${vdir}: 上游未发现匹配 v${vdir}.x 的正式版，跳过"
                 continue
               fi
               if [ "$latest" != "$current" ]; then
                 echo "::notice::${vdir}: 上游有新版本 ${current} -> ${latest}"
-                sed -i "s/^ARG RABBITMQ_VERSION=.*/ARG RABBITMQ_VERSION=${latest}/" "$dockerfile"
+                # 精准替换ARG行，保留原有行格式，只替换版本号
+                sed -i -E "s/^(ARG[[:space:]]+RABBITMQ_VERSION=).*/\1${latest}/" "$dockerfile"
                 matrix_entries_arr+=("{\"version\":\"${vdir}\",\"rabbitmq_version\":\"${latest}\"}")
                 should_commit="yes"
               else
@@ -153,8 +164,9 @@ jobs:
             # 仅保留实际存在 <版本>/UOS/Dockerfile 的目录 (防止 workflow_dispatch 手输错版本)
             while IFS= read -r v; do
               if [[ -n "${v}" && -f "${v}/UOS/Dockerfile" ]]; then
-                cur="$(grep -m1 -E '^ARG RABBITMQ_VERSION=' "${v}/UOS/Dockerfile" | cut -d= -f2)"
-                test -n "$cur"
+                # 【同步修复】变更模式下ARG提取，和上游模式保持一致
+                cur="$(sed -nE 's/^ARG[[:space:]]+RABBITMQ_VERSION=([^ #]+).*/\1/p' "${v}/UOS/Dockerfile")"
+                test -n "$cur" || { echo "::warning::${v}/UOS/Dockerfile 缺少RABBITMQ_VERSION"; continue; }
                 matrix_entries_arr+=("{\"version\":\"${v}\",\"rabbitmq_version\":\"${cur}\"}")
               fi
             done < <(printf '%s\n' "${versions}")
