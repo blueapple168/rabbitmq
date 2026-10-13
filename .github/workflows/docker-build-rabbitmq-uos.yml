@@ -78,7 +78,6 @@ jobs:
         id: set
         run: |
           set -eux
-
           mode="diff"
           case "${{ github.event_name }}" in
             schedule) mode="upstream" ;;
@@ -89,10 +88,8 @@ jobs:
               ;;
           esac
           echo "mode=${mode}" >> "$GITHUB_STEP_SUMMARY" || true
-
-          matrix_entries=""
+          matrix_entries_arr=()
           should_commit="no"
-
           if [ "$mode" = "upstream" ]; then
             ########################################
             # 上游监听模式: 检查 rabbitmq-server 官方 releases
@@ -104,9 +101,9 @@ jobs:
               current="$(grep -m1 -E '^ARG RABBITMQ_VERSION=' "$dockerfile" | cut -d= -f2)"
               test -n "$current"
               latest="$(
-                curl -fsSL -H 'Accept: application/vnd.github+json' \
+                curl --max-time 20 --retry 2 -fsSL -H 'Accept: application/vnd.github+json' \
                   'https://api.github.com/repos/rabbitmq/rabbitmq-server/releases?per_page=100' \
-                | jq -r --arg v "$vdir" '
+                | jq -r --arg vdir "$vdir" '
                     [ .[]
                       | select(.draft == false and .prerelease == false)
                       | select(.tag_name | test("^v" + $vdir + "\\.[0-9]+$"))
@@ -114,7 +111,7 @@ jobs:
                     ]
                     | sort_by(split(".") | map(tonumber))
                     | last // empty
-                  '
+                  ' || true
               )"
               if [ -z "$latest" ]; then
                 echo "::notice::${vdir}: 上游未发现匹配 v${vdir}.x 的正式版，跳过"
@@ -123,30 +120,12 @@ jobs:
               if [ "$latest" != "$current" ]; then
                 echo "::notice::${vdir}: 上游有新版本 ${current} -> ${latest}"
                 sed -i "s/^ARG RABBITMQ_VERSION=.*/ARG RABBITMQ_VERSION=${latest}/" "$dockerfile"
-                matrix_entries="${matrix_entries}{\"version\":\"${vdir}\",\"rabbitmq_version\":\"${latest}\"},"
+                matrix_entries_arr+=("{\"version\":\"${vdir}\",\"rabbitmq_version\":\"${latest}\"}")
                 should_commit="yes"
               else
                 echo "::notice::${vdir}: 已是上游最新正式版 ${current}，无需构建"
               fi
             done < <(find . -mindepth 3 -maxdepth 3 -path './*/UOS/Dockerfile' | sed 's|^\./||' | sort)
-
-            # 提交 Dockerfile 版本升级，保持仓库与上游同步 (仅上游模式)
-            if [ "$should_commit" = "yes" ]; then
-              git config user.name "github-actions[bot]"
-              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-              git add -u
-              if git diff --cached --quiet; then
-                echo "::warning::版本号已更新但没有可提交的变更"
-              else
-                git commit -m "chore(bump): RABBITMQ_VERSION 升级为上游最新正式版 (由定时任务自动检测)"
-                if git push; then
-                  echo "已提交版本升级 commit 到 master"
-                else
-                  # 推送失败不阻断构建: 本次 run 仍会用新版本号构建镜像
-                  echo "::warning::版本升级 commit 推送失败 (可能因分支保护)，本次构建继续使用检测到的新版本号"
-                fi
-              fi
-            fi
           else
             ########################################
             # 变更检测模式 (原有逻辑): 由本次提交涉及的文件决定
@@ -176,12 +155,29 @@ jobs:
               if [[ -n "${v}" && -f "${v}/UOS/Dockerfile" ]]; then
                 cur="$(grep -m1 -E '^ARG RABBITMQ_VERSION=' "${v}/UOS/Dockerfile" | cut -d= -f2)"
                 test -n "$cur"
-                matrix_entries="${matrix_entries}{\"version\":\"${v}\",\"rabbitmq_version\":\"${cur}\"},"
+                matrix_entries_arr+=("{\"version\":\"${v}\",\"rabbitmq_version\":\"${cur}\"}")
               fi
             done < <(printf '%s\n' "${versions}")
           fi
-
-          matrix="[$(printf '%s' "$matrix_entries" | sed 's/,$//')]"
+          # 生成最终矩阵
+          matrix="[$(IFS=,; echo "${matrix_entries_arr[*]}")]"
+          # 提交 Dockerfile 版本升级，保持仓库与上游同步 (仅上游模式)
+          if [ "$mode" = "upstream" ] && [ "$should_commit" = "yes" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -u
+            if git diff --cached --quiet; then
+              echo "::warning::版本号已更新但没有可提交的变更"
+            else
+              git commit -m "chore(bump): RABBITMQ_VERSION 升级为上游最新正式版 (由定时任务自动检测)"
+              if git push; then
+                echo "已提交版本升级 commit 到 master"
+              else
+                # 推送失败不阻断构建: 本次 run 仍会用新版本号构建镜像
+                echo "::warning::版本升级 commit 推送失败 (可能因分支保护)，本次构建继续使用检测到的新版本号"
+              fi
+            fi
+          fi
           if [ "$matrix" = "[]" ]; then
             echo "::notice::没有需要构建的版本，跳过"
             echo "matrix=[]" >> "$GITHUB_OUTPUT"
